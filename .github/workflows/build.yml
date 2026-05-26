@@ -53,12 +53,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GitHub-hosted runner labels reference:
+          #   https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners
+          # ARM Linux uses the dedicated `ubuntu-24.04-arm` runner (not `ubuntu-latest-arm64`).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
             asset_suffix: linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest-arm64
+            runner: ubuntu-24.04-arm
             archive: tar.gz
             asset_suffix: linux-arm64
           - target: x86_64-apple-darwin
@@ -96,7 +99,6 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: cargo test
-        if: matrix.runner != 'ubuntu-latest-arm64'
         env:
           BRIDGE_JAR_PATH: ${{ github.workspace }}/bridge/target/jadx-bridge.jar
         run: cargo test --release --locked --target ${{ matrix.target }}
@@ -129,10 +131,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Step 3: on a v* tag, gather every artifact and publish a GitHub Release.
+  # We use `always()` + a `success()` check on the matrix so a partial release
+  # (some platforms missing) is still published — users get binaries for the
+  # platforms that did build, and the release notes show which jobs failed.
   # ---------------------------------------------------------------------------
   release:
     name: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && always()
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -141,12 +146,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: bail out if no platform artifacts exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No platform archives produced — every matrix job failed. Aborting release." >&2
+            exit 1
+          fi
+          echo "Found ${#archives[@]} platform archive(s):"
+          ls -la dist/
       - name: checksums
         shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          ls -la
-          sha256sum * > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
@@ -155,3 +172,4 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS
           generate_release_notes: true
+          fail_on_unmatched_files: false
