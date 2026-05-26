@@ -7,7 +7,7 @@ This npm package is a thin Node.js shim around the [main project](https://github
 ## Quick start
 
 ```bash
-npx -y jadx-headless-mcp
+npx -y jadx-headless-mcp@latest
 ```
 
 Or wire it into Claude Code / Claude Desktop / any stdio MCP client. **One config serves any APK** — switch files by calling the `load_apk` MCP tool in conversation, no restart required:
@@ -17,7 +17,7 @@ Or wire it into Claude Code / Claude Desktop / any stdio MCP client. **One confi
   "mcpServers": {
     "jadx": {
       "command": "npx",
-      "args": ["-y", "jadx-headless-mcp"]
+      "args": ["-y", "jadx-headless-mcp@latest"]
     }
   }
 }
@@ -26,10 +26,12 @@ Or wire it into Claude Code / Claude Desktop / any stdio MCP client. **One confi
 Claude Code one-liner:
 
 ```bash
-claude mcp add jadx -- npx -y jadx-headless-mcp
+claude mcp add jadx -- npx -y jadx-headless-mcp@latest
 ```
 
 Then in conversation: *"Load `/path/to/app.apk` and show me the package tree."* Claude calls `load_apk` → `get_package_tree`. To switch APKs later just say so — `load_apk` accepts a different path at any time.
+
+> ⚠️ **Pin `@latest` (or an explicit version) — bare `npx jadx-headless-mcp` reuses npx's cached version forever.** npx does not re-check the registry on subsequent runs when no version tag is specified, so without `@latest` you'd be stuck on whichever version was first downloaded. If you've already installed the bare form and want to upgrade, clear the wrapper cache (`%LOCALAPPDATA%\jadx-headless-mcp-npm` on Windows, `~/.cache/jadx-headless-mcp-npm` on Linux/macOS) and restart your MCP client.
 
 ## Requirements
 

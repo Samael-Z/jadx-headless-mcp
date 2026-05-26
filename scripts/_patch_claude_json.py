@@ -19,11 +19,15 @@ SERVER_NAME = "jadx-headless-mcp"
 # v0.3.0+ supports runtime `load_apk` tool calls, so no --apk in the launch
 # args. One MCP entry serves any APK. To switch files: in conversation, say
 # "load <path>" and Claude will call the load_apk tool.
+#
+# `@latest` is important — without it, npx caches the resolved version on
+# first run and never re-checks the registry. Pinning to `@latest` makes npx
+# check for newer releases on every startup.
 ENTRY = {
     "command": "npx",
     "args": [
         "-y",
-        "jadx-headless-mcp",
+        "jadx-headless-mcp@latest",
     ],
 }
 

@@ -38,12 +38,19 @@ That's it — no Python, no Maven, no JADX installation needed by end users.
 If you have Node.js 18+:
 
 ```bash
-claude mcp add jadx -- npx -y jadx-headless-mcp
+claude mcp add jadx -- npx -y jadx-headless-mcp@latest
 ```
 
 That's it. One MCP entry serves any APK — call the `load_apk` tool in conversation to point at whatever file you want to analyze, switch by calling it again. No need to edit config or restart Claude when switching files.
 
 The npm package is a thin shim that downloads the platform-specific binary (~52 MB) from the matching GitHub Release on first run and caches it locally. Subsequent runs skip the download.
+
+> **Why `@latest`?** A bare `npx -y jadx-headless-mcp` reuses whatever version npx happened to download the first time and **does not check the registry for newer releases**. That's an npx semantics, not a bug in this package. Two ways to stay current:
+>
+> - `npx -y jadx-headless-mcp@latest` — npx re-checks the registry on every invocation (slight startup overhead, but always picks up new releases). **This is the recommended config.**
+> - `npx -y jadx-headless-mcp@0.3.1` — pin to an exact version. More predictable; you control upgrades by editing the config.
+>
+> If you already registered the bare form and want to upgrade now, also clear the cache: `rm -rf "$LOCALAPPDATA/jadx-headless-mcp-npm"` (Windows) or `rm -rf ~/.cache/jadx-headless-mcp-npm` (Linux/macOS), then restart Claude Code.
 
 ### Option 2 — pre-built binary
 
