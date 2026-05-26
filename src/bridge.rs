@@ -187,11 +187,11 @@ pub fn materialize_bridge_jar(override_path: Option<&Path>, bundled: &[u8]) -> R
         return Ok(p.to_path_buf());
     }
 
-    // Stable location: <data-local>/jadx-handless-mcp/jadx-bridge-<size>.jar
+    // Stable location: <data-local>/jadx-headless-mcp/jadx-bridge-<size>.jar
     // The size suffix invalidates the cache when the binary is updated.
     let dir = dirs::data_local_dir()
-        .map(|d| d.join("jadx-handless-mcp"))
-        .unwrap_or_else(|| std::env::temp_dir().join("jadx-handless-mcp"));
+        .map(|d| d.join("jadx-headless-mcp"))
+        .unwrap_or_else(|| std::env::temp_dir().join("jadx-headless-mcp"));
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let target = dir.join(format!("jadx-bridge-{}.jar", bundled.len()));
     if !target.is_file() {

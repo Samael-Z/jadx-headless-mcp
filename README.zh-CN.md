@@ -1,4 +1,4 @@
-# jadx-handless-mcp
+# jadx-headless-mcp
 
 [English](README.md) | **简体中文**
 
@@ -35,15 +35,15 @@
 
 ### 方式一 —— 直接下载预编译二进制（推荐）
 
-从 [最新 release](https://github.com/Samael-Z/jadx-handless-mcp/releases/latest) 下载对应系统的压缩包：
+从 [最新 release](https://github.com/Samael-Z/jadx-headless-mcp/releases/latest) 下载对应系统的压缩包：
 
 | 操作系统 / 架构 | 文件 |
 |---|---|
-| Linux x86_64 | `jadx-handless-mcp-linux-x86_64.tar.gz` |
-| Linux arm64 | `jadx-handless-mcp-linux-arm64.tar.gz` |
-| macOS Intel | `jadx-handless-mcp-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `jadx-handless-mcp-macos-arm64.tar.gz` |
-| Windows x86_64 | `jadx-handless-mcp-windows-x86_64.zip` |
+| Linux x86_64 | `jadx-headless-mcp-linux-x86_64.tar.gz` |
+| Linux arm64 | `jadx-headless-mcp-linux-arm64.tar.gz` |
+| macOS Intel | `jadx-headless-mcp-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `jadx-headless-mcp-macos-arm64.tar.gz` |
+| Windows x86_64 | `jadx-headless-mcp-windows-x86_64.zip` |
 
 解压后把 `jadx-mcp` 放到 `PATH` 下的任意目录。
 
@@ -51,8 +51,8 @@
 
 ```bash
 # 需要 Rust 1.80+、JDK 11+ 和 Maven 在 PATH 中（会本地构建 sidecar JAR）
-git clone https://github.com/Samael-Z/jadx-handless-mcp
-cd jadx-handless-mcp
+git clone https://github.com/Samael-Z/jadx-headless-mcp
+cd jadx-headless-mcp
 cd bridge && mvn -DskipTests package && cd ..
 cargo install --path . --locked
 ```
@@ -126,8 +126,8 @@ search_classes_by_keyword { search_term, ... }    → 跨包全文搜索
 ## 从源码构建
 
 ```bash
-git clone https://github.com/Samael-Z/jadx-handless-mcp
-cd jadx-handless-mcp
+git clone https://github.com/Samael-Z/jadx-headless-mcp
+cd jadx-headless-mcp
 
 # 1. Java sidecar（需要 JDK 11+ 和 Maven）
 cd bridge && mvn -DskipTests package && cd ..

@@ -1,8 +1,8 @@
-package com.zin.jadxhandless.server.routes;
+package com.zin.jadxheadless.server.routes;
 
-import com.zin.jadxhandless.server.BridgeContext;
-import com.zin.jadxhandless.util.Errors;
-import com.zin.jadxhandless.util.Pagination;
+import com.zin.jadxheadless.server.BridgeContext;
+import com.zin.jadxheadless.util.Errors;
+import com.zin.jadxheadless.util.Pagination;
 import io.javalin.http.Context;
 import jadx.api.JavaClass;
 import jadx.api.JavaField;

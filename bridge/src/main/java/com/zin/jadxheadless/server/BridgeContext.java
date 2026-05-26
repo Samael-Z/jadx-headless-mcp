@@ -1,6 +1,6 @@
-package com.zin.jadxhandless.server;
+package com.zin.jadxheadless.server;
 
-import com.zin.jadxhandless.util.DecompilationCache;
+import com.zin.jadxheadless.util.DecompilationCache;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
 

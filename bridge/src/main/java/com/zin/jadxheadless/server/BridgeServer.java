@@ -1,10 +1,10 @@
-package com.zin.jadxhandless.server;
+package com.zin.jadxheadless.server;
 
-import com.zin.jadxhandless.server.routes.ClassRoutes;
-import com.zin.jadxhandless.server.routes.MethodRoutes;
-import com.zin.jadxhandless.server.routes.RefactoringRoutes;
-import com.zin.jadxhandless.server.routes.ResourceRoutes;
-import com.zin.jadxhandless.server.routes.XrefsRoutes;
+import com.zin.jadxheadless.server.routes.ClassRoutes;
+import com.zin.jadxheadless.server.routes.MethodRoutes;
+import com.zin.jadxheadless.server.routes.RefactoringRoutes;
+import com.zin.jadxheadless.server.routes.ResourceRoutes;
+import com.zin.jadxheadless.server.routes.XrefsRoutes;
 import io.javalin.Javalin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

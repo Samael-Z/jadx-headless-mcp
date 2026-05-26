@@ -1,4 +1,4 @@
-package com.zin.jadxhandless.util;
+package com.zin.jadxheadless.util;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;

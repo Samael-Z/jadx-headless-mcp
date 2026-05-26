@@ -1,4 +1,4 @@
-# jadx-handless-mcp
+# jadx-headless-mcp
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -35,15 +35,15 @@ That's it — no Python, no Maven, no JADX installation needed by end users.
 
 ### Option 1 — pre-built binary (recommended)
 
-Download the archive for your OS from the [latest release](https://github.com/Samael-Z/jadx-handless-mcp/releases/latest):
+Download the archive for your OS from the [latest release](https://github.com/Samael-Z/jadx-headless-mcp/releases/latest):
 
 | OS / arch | archive |
 |---|---|
-| Linux x86_64 | `jadx-handless-mcp-linux-x86_64.tar.gz` |
-| Linux arm64 | `jadx-handless-mcp-linux-arm64.tar.gz` |
-| macOS Intel | `jadx-handless-mcp-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `jadx-handless-mcp-macos-arm64.tar.gz` |
-| Windows x86_64 | `jadx-handless-mcp-windows-x86_64.zip` |
+| Linux x86_64 | `jadx-headless-mcp-linux-x86_64.tar.gz` |
+| Linux arm64 | `jadx-headless-mcp-linux-arm64.tar.gz` |
+| macOS Intel | `jadx-headless-mcp-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `jadx-headless-mcp-macos-arm64.tar.gz` |
+| Windows x86_64 | `jadx-headless-mcp-windows-x86_64.zip` |
 
 Unpack and put the `jadx-mcp` binary somewhere on `PATH`.
 
@@ -51,8 +51,8 @@ Unpack and put the `jadx-mcp` binary somewhere on `PATH`.
 
 ```bash
 # Requires Rust 1.80+, JDK 11+, and Maven on PATH (builds the sidecar JAR locally).
-git clone https://github.com/Samael-Z/jadx-handless-mcp
-cd jadx-handless-mcp
+git clone https://github.com/Samael-Z/jadx-headless-mcp
+cd jadx-headless-mcp
 cd bridge && mvn -DskipTests package && cd ..
 cargo install --path . --locked
 ```
@@ -126,8 +126,8 @@ Renames are in-memory only — visible to subsequent tool calls in the same sess
 ## Building from source
 
 ```bash
-git clone https://github.com/Samael-Z/jadx-handless-mcp
-cd jadx-handless-mcp
+git clone https://github.com/Samael-Z/jadx-headless-mcp
+cd jadx-headless-mcp
 
 # 1. Java sidecar (needs JDK 11+ and Maven)
 cd bridge && mvn -DskipTests package && cd ..

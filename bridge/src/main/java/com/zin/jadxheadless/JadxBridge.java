@@ -1,11 +1,11 @@
 /*
- * Copyright (c) 2026 jadx-handless-mcp contributors
+ * Copyright (c) 2026 jadx-headless-mcp contributors
  * Apache License 2.0
  */
-package com.zin.jadxhandless;
+package com.zin.jadxheadless;
 
-import com.zin.jadxhandless.server.BridgeContext;
-import com.zin.jadxhandless.server.BridgeServer;
+import com.zin.jadxheadless.server.BridgeContext;
+import com.zin.jadxheadless.server.BridgeServer;
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
 import jadx.api.impl.NoOpCodeCache;

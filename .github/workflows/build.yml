@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          stage="jadx-handless-mcp-${{ matrix.asset_suffix }}"
+          stage="jadx-headless-mcp-${{ matrix.asset_suffix }}"
           mkdir -p "$stage"
           if [[ "${{ matrix.runner }}" == windows-* ]]; then
             cp "target/${{ matrix.target }}/release/jadx-mcp.exe" "$stage/"
@@ -133,7 +133,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: jadx-handless-mcp-${{ matrix.asset_suffix }}
+          name: jadx-headless-mcp-${{ matrix.asset_suffix }}
           path: ${{ env.asset }}
           retention-days: 7
 
