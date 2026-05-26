@@ -33,7 +33,17 @@ That's it — no Python, no Maven, no JADX installation needed by end users.
 
 ## Install
 
-### Option 1 — pre-built binary (recommended)
+### Option 1 — `npx` (zero install, recommended)
+
+If you have Node.js 18+:
+
+```bash
+claude mcp add jadx -- npx -y jadx-headless-mcp --apk /absolute/path/to/your.apk
+```
+
+The npm package is a thin shim that downloads the platform-specific binary (~52 MB) from the matching GitHub Release on first run and caches it locally. Subsequent runs skip the download.
+
+### Option 2 — pre-built binary
 
 Download the archive for your OS from the [latest release](https://github.com/Samael-Z/jadx-headless-mcp/releases/latest):
 
@@ -47,7 +57,7 @@ Download the archive for your OS from the [latest release](https://github.com/Sa
 
 Unpack and put the `jadx-mcp` binary somewhere on `PATH`.
 
-### Option 2 — `cargo install`
+### Option 3 — `cargo install`
 
 ```bash
 # Requires Rust 1.80+, JDK 11+, and Maven on PATH (builds the sidecar JAR locally).
@@ -101,7 +111,7 @@ If `java` isn't on PATH for the Desktop app's environment, set `JADX_MCP_JAVA` o
 
 ## Tools exposed
 
-Twenty-four tools across five categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
+Twenty-five tools across five categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
 
 | Category | Tool |
 |---|---|

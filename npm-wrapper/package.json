@@ -1,0 +1,36 @@
+{
+  "name": "jadx-headless-mcp",
+  "version": "0.2.0",
+  "description": "Headless JADX Android decompiler exposed as a Model Context Protocol (MCP) server. Single-binary wrapper installable via npx.",
+  "author": "sameelsummer",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Samael-Z/jadx-headless-mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Samael-Z/jadx-headless-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Samael-Z/jadx-headless-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jadx",
+    "android",
+    "apk",
+    "decompiler",
+    "reverse-engineering",
+    "claude"
+  ],
+  "bin": {
+    "jadx-headless-mcp": "cli.js"
+  },
+  "files": [
+    "cli.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

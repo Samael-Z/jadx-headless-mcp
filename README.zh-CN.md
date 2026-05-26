@@ -33,7 +33,17 @@
 
 ## 安装
 
-### 方式一 —— 直接下载预编译二进制（推荐）
+### 方式一 —— `npx`（零安装，推荐）
+
+只要装了 Node.js 18+：
+
+```bash
+claude mcp add jadx -- npx -y jadx-headless-mcp --apk /绝对路径/到/你的.apk
+```
+
+npm 包是一个轻壳脚本，首次运行时从对应版本的 GitHub Release 下载平台二进制（约 52 MB）缓存到本地，之后再调用就直接用缓存。
+
+### 方式二 —— 直接下载预编译二进制
 
 从 [最新 release](https://github.com/Samael-Z/jadx-headless-mcp/releases/latest) 下载对应系统的压缩包：
 
@@ -47,7 +57,7 @@
 
 解压后把 `jadx-mcp` 放到 `PATH` 下的任意目录。
 
-### 方式二 —— `cargo install`
+### 方式三 —— `cargo install`
 
 ```bash
 # 需要 Rust 1.80+、JDK 11+ 和 Maven 在 PATH 中（会本地构建 sidecar JAR）
@@ -101,7 +111,7 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 
 ## 暴露的工具
 
-五大类共 24 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
+五大类共 25 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
 
 | 类别 | 工具 |
 |---|---|
