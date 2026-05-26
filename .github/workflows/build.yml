@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: write
+  # id-token: write is required by `npm publish --provenance` so the npm registry
+  # can verify the tarball was actually built by this GitHub Actions workflow.
+  # Without it, --provenance fails with "OIDC token unavailable".
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -181,3 +185,66 @@ jobs:
             dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------------------
+  # Step 4: on a v* tag, after the GitHub Release is live (so the npm wrapper
+  # can fetch the binaries from it), publish the wrapper to npm.
+  # Auto-syncs npm-wrapper/package.json `version` to the tag — no manual bump
+  # required when cutting a new release.
+  # ---------------------------------------------------------------------------
+  npm-publish:
+    name: npm publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: derive npm version from tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Strip the leading "v" from the tag, e.g. v0.3.0 → 0.3.0
+          tag="${GITHUB_REF##*/}"
+          ver="${tag#v}"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Publishing npm version: $ver"
+      - name: sync package.json version
+        working-directory: npm-wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          # In-place rewrite of the version field. We don't `npm version` because
+          # that creates a git commit + tag — we're already on a tag.
+          node -e "
+            const fs = require('fs');
+            const p = require('./package.json');
+            p.version = '${{ steps.version.outputs.version }}';
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+          echo "package.json now declares:"
+          node -e "console.log(require('./package.json').version)"
+      - name: skip if already published
+        id: check
+        working-directory: npm-wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(node -e "console.log(require('./package.json').name)")
+          ver=$(node -e "console.log(require('./package.json').version)")
+          if npm view "${name}@${ver}" version 2>/dev/null; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${name}@${ver} already on npm — skipping publish."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: npm publish
+        if: steps.check.outputs.already_published != 'true'
+        working-directory: npm-wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets._NPMTOKEN }}
+        run: npm publish --access public --provenance
