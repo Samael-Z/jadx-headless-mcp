@@ -1,5 +1,7 @@
 # jadx-handless-mcp
 
+**English** | [简体中文](README.zh-CN.md)
+
 Headless **JADX** Android decompiler exposed as a **Model Context Protocol** (MCP) server, written in Rust for fast cold start and easy single-binary distribution. Lets Claude (or any MCP client) reverse-engineer `.apk`, `.dex`, `.aab`, `.xapk`, `.apkm` files — list classes, fetch decompiled Java source, cross-reference, rename symbols, search by keyword — without launching JADX-GUI.
 
 > Inspired by [`blacktop/ida-mcp-rs`](https://github.com/blacktop/ida-mcp-rs); this is the JADX flavor.
