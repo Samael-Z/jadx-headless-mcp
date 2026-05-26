@@ -7,17 +7,17 @@ This npm package is a thin Node.js shim around the [main project](https://github
 ## Quick start
 
 ```bash
-npx -y jadx-headless-mcp --apk /absolute/path/to/your.apk
+npx -y jadx-headless-mcp
 ```
 
-Or wire it into Claude Code / Claude Desktop / any stdio MCP client:
+Or wire it into Claude Code / Claude Desktop / any stdio MCP client. **One config serves any APK** — switch files by calling the `load_apk` MCP tool in conversation, no restart required:
 
 ```jsonc
 {
   "mcpServers": {
     "jadx": {
       "command": "npx",
-      "args": ["-y", "jadx-headless-mcp", "--apk", "/absolute/path/to/your.apk"]
+      "args": ["-y", "jadx-headless-mcp"]
     }
   }
 }
@@ -26,8 +26,10 @@ Or wire it into Claude Code / Claude Desktop / any stdio MCP client:
 Claude Code one-liner:
 
 ```bash
-claude mcp add jadx -- npx -y jadx-headless-mcp --apk /absolute/path/to/your.apk
+claude mcp add jadx -- npx -y jadx-headless-mcp
 ```
+
+Then in conversation: *"Load `/path/to/app.apk` and show me the package tree."* Claude calls `load_apk` → `get_package_tree`. To switch APKs later just say so — `load_apk` accepts a different path at any time.
 
 ## Requirements
 

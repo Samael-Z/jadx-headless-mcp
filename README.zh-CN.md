@@ -38,8 +38,10 @@
 只要装了 Node.js 18+：
 
 ```bash
-claude mcp add jadx -- npx -y jadx-headless-mcp --apk /绝对路径/到/你的.apk
+claude mcp add jadx -- npx -y jadx-headless-mcp
 ```
+
+注册一次，分析任意 APK ——在对话里调 `load_apk` 工具指定要分析的文件即可，切换 APK 也是一句话，不需要改配置或重启 Claude。
 
 npm 包是一个轻壳脚本，首次运行时从对应版本的 GitHub Release 下载平台二进制（约 52 MB）缓存到本地，之后再调用就直接用缓存。
 
@@ -72,15 +74,10 @@ cargo install --path . --locked
 ### Claude Code CLI
 
 ```bash
-claude mcp add jadx -- jadx-mcp --apk /绝对路径/到/你的.apk
+claude mcp add jadx -- jadx-mcp
 ```
 
-如果要同时分析多个 APK，用不同的名字注册：
-
-```bash
-claude mcp add jadx-app -s project -- jadx-mcp --apk ./apks/app.apk
-claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
-```
+一份配置，任意 APK。对话里调 `load_apk` 工具指定文件；再调一次换另一个文件。
 
 ### Claude Desktop / Codex / 通用 stdio 配置
 
@@ -88,8 +85,7 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 {
   "mcpServers": {
     "jadx": {
-      "command": "jadx-mcp",
-      "args": ["--apk", "/绝对路径/到/你的.apk"]
+      "command": "jadx-mcp"
     }
   }
 }
@@ -97,11 +93,21 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 
 如果 Desktop 应用的运行环境里 `java` 不在 PATH，可以设置 `JADX_MCP_JAVA` 环境变量，或者用 `--java /完整/路径/到/java` 显式传入。
 
+### 在对话里使用
+
+注册完后，直接说：
+
+> 加载 `E:\\path\\to\\app.apk`，给我看包结构
+
+Claude 会调 `load_apk`（首次约 30 秒，jadx 反编译耗时；APK 越大越久），然后调 `get_package_tree`。要切换 APK：
+
+> 现在换成 `D:\\samples\\other.apk`，找包含"encrypt"的类
+
 ### 常用参数 / 环境变量
 
 | 命令行参数 | 环境变量 | 用途 |
 |---|---|---|
-| `--apk PATH` | `JADX_MCP_APK` | 要加载的 APK / DEX / AAB / XAPK / APKM / JAR 文件。**必填** |
+| `--apk PATH` | `JADX_MCP_APK` | **可选。** 启动时自动加载的 APK。等价于立刻调一次 `load_apk`。如果只分析一个 APK 可以用，多 APK 场景不推荐 |
 | `--java PATH` | `JADX_MCP_JAVA` | 覆盖 Java 可执行文件路径。默认顺序：`$JAVA_HOME/bin/java` → `PATH` |
 | `--bridge-jar PATH` | `JADX_MCP_BRIDGE_JAR` | 使用其他 bridge JAR（比如本地构建的）。默认用内嵌的 |
 | `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | 额外的 JVM 参数。默认 `-Xmx2g`。可以多次指定 |
@@ -111,10 +117,11 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 
 ## 暴露的工具
 
-五大类共 25 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
+六大类共 27 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
 
 | 类别 | 工具 |
 |---|---|
+| **会话** | `load_apk`、`current_apk` |
 | **类相关** | `get_all_classes`、`get_class_source`、`get_methods_of_class`、`get_fields_of_class`、`get_smali_of_class`、`get_main_activity_class`、`get_main_application_classes_names`、`get_main_application_classes_code`、`get_package_tree`、`search_classes_by_keyword`、`get_cache_stats`、`clear_cache` |
 | **方法相关** | `get_method_by_name`、`search_method_by_name` |
 | **资源相关** | `get_android_manifest`、`get_strings`、`get_all_resource_file_names`、`get_resource_file` |
@@ -124,11 +131,13 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 典型分析流程：
 
 ```
+load_apk { path: "/绝对路径/到/app.apk" }          → 加载 APK（约 30 秒）
 get_package_tree                                  → 看 APK 整体结构，找到应用包名
 get_main_application_classes_names                → 列出业务方代码（过滤掉三方库）
 get_class_source { class_name: "..." }            → 看反编译源码
 get_xrefs_to_method { class_name, method_name }   → 追调用链
 search_classes_by_keyword { search_term, ... }    → 跨包全文搜索
+load_apk { path: "/另一个/app.apk" }               → 会话内切换 APK
 ```
 
 **重命名仅在内存生效** —— 当前会话里的后续工具调用能看到改名结果，但不会持久化到磁盘。

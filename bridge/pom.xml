@@ -6,7 +6,7 @@
 
     <groupId>com.zin.jadxheadless</groupId>
     <artifactId>jadx-bridge</artifactId>
-    <version>0.2.1</version>
+    <version>0.3.0</version>
     <packaging>jar</packaging>
 
     <properties>

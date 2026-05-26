@@ -31,5 +31,8 @@ Thumbs.db
 .npmrc
 **/.npmrc
 
+# Personal local-only dev notes (release cheat sheet etc.)
+dev-readme.md
+
 # Vendored jar drop location (built locally; release uses CI artifact)
 src/embedded/jadx-bridge.jar

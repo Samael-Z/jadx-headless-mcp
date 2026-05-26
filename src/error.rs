@@ -6,6 +6,16 @@ pub enum ToolError {
     #[error("bridge unreachable: {0}")]
     Bridge(String),
 
+    #[error(
+        "No APK is loaded yet. Call `load_apk` with the absolute path to your \
+         .apk/.dex/.aab/.xapk/.apkm/.jar file first. Example: \
+         load_apk(path=\"/abs/path/to/app.apk\")"
+    )]
+    NoApkLoaded,
+
+    #[error("invalid argument: {0}")]
+    Invalid(String),
+
     #[error("internal: {0}")]
     Internal(String),
 }

@@ -1,7 +1,17 @@
-//! MCP server: rmcp ServerHandler + tool router. Each #[tool] handler is a thin
-//! proxy that calls the bridge over HTTP and forwards the JSON response.
+//! MCP server: rmcp ServerHandler + tool router.
+//!
+//! State model: the server starts with no APK loaded. Clients call `load_apk`
+//! to spawn a Java bridge sidecar for the given file. Other tools fail with a
+//! helpful error message until that happens. `load_apk` can be called again
+//! at any time to switch APKs — the old bridge is torn down before the new
+//! one starts.
+//!
+//! Concurrency: tool handlers take a read-lock on the server state (cheap;
+//! they just clone the HttpClient and drop the lock before doing HTTP). The
+//! `load_apk` tool takes a write-lock for the duration of the swap, which
+//! blocks tool calls briefly during a switch.
 
-use crate::bridge::Bridge;
+use crate::bridge::{Bridge, SpawnTemplate};
 use crate::error::ToolError;
 use crate::http::HttpClient;
 use crate::tools::*;
@@ -10,25 +20,88 @@ use rmcp::{
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Default)]
+struct ServerState {
+    bridge: Option<Bridge>,
+    current_apk: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 pub struct JadxMcpServer {
-    client: HttpClient,
+    state: Arc<RwLock<ServerState>>,
+    spawn_template: Arc<SpawnTemplate>,
     // Read by the macro-generated `#[tool_handler]` impl, hence the allow.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl JadxMcpServer {
-    pub fn new(client: HttpClient) -> Self {
+    pub fn new(spawn_template: SpawnTemplate) -> Self {
         Self {
-            client,
+            state: Arc::new(RwLock::new(ServerState::default())),
+            spawn_template: Arc::new(spawn_template),
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Helper: turn a `serde_json::Value` from the bridge into a one-piece tool result.
+    /// Replace the currently loaded APK with a new one (or load the first APK).
+    /// Spawns a fresh bridge JVM, shuts the old one down.
+    pub async fn load_apk_internal(&self, path: PathBuf) -> Result<LoadedApkInfo, ToolError> {
+        // Validate up front so we don't tear down the existing bridge just to fail.
+        if !path.is_file() {
+            return Err(ToolError::Invalid(format!(
+                "APK not found at: {}",
+                path.display()
+            )));
+        }
+
+        // Spawn the new bridge BEFORE shutting down the old one. If the spawn
+        // fails, the current bridge keeps serving tool calls instead of leaving
+        // the server unusable.
+        let cfg = self.spawn_template.with_apk(path.clone());
+        let new_bridge = Bridge::spawn(cfg).await.map_err(|e| {
+            ToolError::Bridge(format!("failed to spawn bridge for {}: {e:#}", path.display()))
+        })?;
+
+        let port = new_bridge.port();
+
+        // Swap in the new bridge under write-lock, then shut down the old one
+        // outside the lock so tool calls can resume immediately.
+        let old = {
+            let mut guard = self.state.write().await;
+            let old = guard.bridge.take();
+            guard.bridge = Some(new_bridge);
+            guard.current_apk = Some(path.clone());
+            old
+        };
+        if let Some(b) = old {
+            b.shutdown().await;
+        }
+
+        tracing::info!(apk = %path.display(), port, "APK loaded");
+        Ok(LoadedApkInfo {
+            apk: path.display().to_string(),
+            bridge_port: port,
+        })
+    }
+
+    /// Tear down the current bridge if any. Used on server shutdown.
+    pub async fn shutdown(&self) {
+        let bridge = {
+            let mut guard = self.state.write().await;
+            guard.current_apk = None;
+            guard.bridge.take()
+        };
+        if let Some(b) = bridge {
+            b.shutdown().await;
+        }
+    }
+
+    /// Wraps a `serde_json::Value` from the bridge into a one-piece tool result.
     fn ok(value: serde_json::Value) -> CallToolResult {
         match Content::json(value) {
             Ok(c) => CallToolResult::success(vec![c]),
@@ -38,19 +111,45 @@ impl JadxMcpServer {
         }
     }
 
+    /// Returns a clone of the current bridge's HTTP client. Cheap (Arc-backed),
+    /// and the read-lock is released as soon as this returns — we never hold
+    /// the lock across an HTTP call.
+    async fn client(&self) -> Result<HttpClient, ToolError> {
+        let guard = self.state.read().await;
+        guard
+            .bridge
+            .as_ref()
+            .map(|b| b.client())
+            .ok_or(ToolError::NoApkLoaded)
+    }
+
     async fn get(&self, path: &str, query: &[(&str, String)]) -> CallToolResult {
-        match self.client.get_json(path, query).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return e.to_tool_result(),
+        };
+        match client.get_json(path, query).await {
             Ok(v) => Self::ok(v),
             Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
         }
     }
 
     async fn post(&self, path: &str, query: &[(&str, String)]) -> CallToolResult {
-        match self.client.post_json(path, query).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return e.to_tool_result(),
+        };
+        match client.post_json(path, query).await {
             Ok(v) => Self::ok(v),
             Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
         }
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct LoadedApkInfo {
+    pub apk: String,
+    pub bridge_port: u16,
 }
 
 fn pagination_qs(offset: &Option<u32>, count: &Option<u32>) -> Vec<(&'static str, String)> {
@@ -66,9 +165,49 @@ fn pagination_qs(offset: &Option<u32>, count: &Option<u32>) -> Vec<(&'static str
 
 #[tool_router]
 impl JadxMcpServer {
+    // ------------------------ Session / lifecycle ------------------------
+
+    #[tool(description = "Load an APK / DEX / AAB / XAPK / APKM / JAR for analysis. \
+        Call this FIRST before using any other tool — every other tool errors out until \
+        an APK is loaded. Call it again at any time to switch to a different file (the \
+        previous bridge JVM is torn down). Loading a large APK can take 20–60 seconds.")]
+    async fn load_apk(
+        &self,
+        Parameters(req): Parameters<LoadApkReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = PathBuf::from(req.path.trim());
+        match self.load_apk_internal(path).await {
+            Ok(info) => Ok(Self::ok(serde_json::json!({
+                "status": "ok",
+                "apk": info.apk,
+                "bridge_port": info.bridge_port,
+                "hint": "APK loaded. Try get_package_tree first to see the structure.",
+            }))),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Report which APK is currently loaded (or that none is). \
+        Useful to check session state before running analysis tools.")]
+    async fn current_apk(&self) -> Result<CallToolResult, McpError> {
+        let guard = self.state.read().await;
+        let payload = match &guard.current_apk {
+            Some(p) => serde_json::json!({
+                "loaded": true,
+                "apk": p.display().to_string(),
+                "bridge_port": guard.bridge.as_ref().map(|b| b.port()),
+            }),
+            None => serde_json::json!({
+                "loaded": false,
+                "hint": "No APK loaded. Call `load_apk` with an absolute path.",
+            }),
+        };
+        Ok(Self::ok(payload))
+    }
+
     // ----------------------------- Classes -----------------------------
 
-    #[tool(description = "List all decompiled classes (including inner classes) in the APK. \
+    #[tool(description = "List all decompiled classes (including inner classes) in the loaded APK. \
                           Returns a paginated envelope with `total`, `returned`, `has_more`, and `classes` (array of FQNs). \
                           Use this to discover what's in the APK before searching.")]
     async fn get_all_classes(
@@ -138,7 +277,7 @@ impl JadxMcpServer {
 
     #[tool(description = "Get a histogram of packages sorted by class count (descending). \
                           Each entry has `name`, `class_count`, `is_likely_library` (heuristic). \
-                          Run this FIRST to understand APK structure before searching.")]
+                          Run this FIRST after `load_apk` to understand APK structure before searching.")]
     async fn get_package_tree(&self) -> Result<CallToolResult, McpError> {
         Ok(self.get("/package-tree", &[]).await)
     }
@@ -328,24 +467,33 @@ impl ServerHandler for JadxMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "Headless JADX Android decompiler over MCP. \
-                 Start with `get_package_tree` to understand the APK's structure, \
-                 then `search_classes_by_keyword` or `get_main_application_classes_names` to narrow \
-                 in on app code, and `get_class_source` / `get_method_by_name` / `get_xrefs_to_*` \
-                 for detailed analysis. Renames are in-memory and do not persist across runs.",
+                 STEP 1: call `load_apk(path)` with the absolute path to your APK / DEX / AAB / XAPK / APKM / JAR. \
+                 STEP 2: call `get_package_tree` to understand the APK's structure. \
+                 STEP 3: drill in with `search_classes_by_keyword`, `get_class_source`, \
+                 `get_method_by_name`, or `get_xrefs_to_*`. \
+                 Call `load_apk` again with a different path at any time to switch APKs. \
+                 Renames are in-memory and do not persist across runs.",
             )
     }
 }
 
-/// Run the MCP server over stdio. Shuts the bridge down when the client disconnects.
-pub async fn run_stdio(server: JadxMcpServer, bridge: Bridge) -> anyhow::Result<()> {
-    let bridge = Arc::new(bridge);
-    let bridge_for_shutdown = bridge.clone();
+/// Run the MCP server over stdio. Optionally auto-loads an APK on startup
+/// before accepting client connections. Shuts the bridge down on disconnect.
+pub async fn run_stdio(server: JadxMcpServer, autoload_apk: Option<PathBuf>) -> anyhow::Result<()> {
+    // Optional autoload BEFORE we start the MCP transport — keeps the
+    // "client sends initialize while bridge is still loading" race away.
+    if let Some(apk) = autoload_apk {
+        tracing::info!(apk = %apk.display(), "autoloading APK from CLI flag");
+        if let Err(e) = server.load_apk_internal(apk).await {
+            tracing::error!("autoload failed: {e}");
+            // Continue serving — the client can call load_apk manually later.
+        }
+    }
 
     let transport = rmcp::transport::stdio();
-    let service = server.serve(transport).await?;
+    let service = server.clone().serve(transport).await?;
     tracing::info!("MCP server ready (stdio)");
 
-    // Wait for either the client to disconnect or a Ctrl-C / SIGTERM.
     let serve_fut = service.waiting();
     tokio::select! {
         res = serve_fut => {
@@ -360,12 +508,14 @@ pub async fn run_stdio(server: JadxMcpServer, bridge: Bridge) -> anyhow::Result<
         }
     }
 
-    bridge_for_shutdown.shutdown().await;
+    server.shutdown().await;
     Ok(())
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async { let _ = tokio::signal::ctrl_c().await; };
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
     #[cfg(unix)]
     {
         let term = async {

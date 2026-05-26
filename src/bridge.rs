@@ -29,6 +29,33 @@ pub struct SpawnConfig {
     pub startup_timeout_secs: u64,
 }
 
+/// Re-usable subset of `SpawnConfig` without the APK path. Held by the server
+/// so it can spawn a fresh bridge each time `load_apk` is called for a
+/// different file, without re-resolving java / bridge.jar / jvm args.
+#[derive(Clone)]
+pub struct SpawnTemplate {
+    pub java_bin: PathBuf,
+    pub bridge_jar: PathBuf,
+    pub host: String,
+    pub port: u16,
+    pub jvm_args: Vec<String>,
+    pub startup_timeout_secs: u64,
+}
+
+impl SpawnTemplate {
+    pub fn with_apk(&self, apk_path: PathBuf) -> SpawnConfig {
+        SpawnConfig {
+            java_bin: self.java_bin.clone(),
+            bridge_jar: self.bridge_jar.clone(),
+            apk_path,
+            host: self.host.clone(),
+            port: self.port,
+            jvm_args: self.jvm_args.clone(),
+            startup_timeout_secs: self.startup_timeout_secs,
+        }
+    }
+}
+
 pub struct Bridge {
     child: Mutex<Option<Child>>,
     port: u16,

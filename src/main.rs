@@ -25,7 +25,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Path to the APK / DEX / AAB / XAPK / JAR to analyze. Required for `serve`.
+    /// Optional: APK / DEX / AAB / XAPK / JAR to autoload on startup. When
+    /// omitted, the server starts with no APK and the client must call the
+    /// `load_apk` MCP tool to point at one (recommended for `claude mcp add`
+    /// configs, since one MCP entry can then serve any APK).
     #[arg(long, env = "JADX_MCP_APK", global = true)]
     apk: Option<PathBuf>,
 
@@ -93,41 +96,38 @@ fn init_tracing() {
 }
 
 async fn serve(cli: Cli) -> Result<()> {
-    let apk = cli
-        .apk
-        .clone()
-        .context("--apk is required for `serve` (or set JADX_MCP_APK)")?;
-    if !apk.is_file() {
-        anyhow::bail!("APK not found: {}", apk.display());
-    }
-
-    // Resolve/materialize the bridge JAR
+    // Resolve resources up-front — we want clear startup errors if java or the
+    // bridge jar are missing, not late errors during the first `load_apk` call.
     let bridge_jar_path = bridge::materialize_bridge_jar(cli.bridge_jar.as_deref(), BUNDLED_BRIDGE_JAR)
         .context("failed to materialize bridge jar")?;
     let java_bin = bridge::resolve_java(cli.java.as_deref()).context("failed to find a Java binary")?;
 
-    tracing::info!(?java_bin, jar = %bridge_jar_path.display(), "using bridge");
+    tracing::info!(?java_bin, jar = %bridge_jar_path.display(), "bridge resources resolved");
 
-    let bridge_handle = bridge::Bridge::spawn(bridge::SpawnConfig {
+    // If --apk was passed, validate the path now so the client sees the error
+    // synchronously at server start. Actual bridge spawn happens after the MCP
+    // transport is connected (run_stdio's autoload path).
+    let autoload_apk = match cli.apk.clone() {
+        Some(p) => {
+            if !p.is_file() {
+                anyhow::bail!("--apk path not found: {}", p.display());
+            }
+            Some(p)
+        }
+        None => None,
+    };
+
+    let spawn_template = bridge::SpawnTemplate {
         java_bin,
         bridge_jar: bridge_jar_path,
-        apk_path: apk.clone(),
         host: cli.bridge_host.clone(),
         port: cli.bridge_port,
         jvm_args: cli.jvm_args.clone(),
         startup_timeout_secs: cli.bridge_startup_secs,
-    })
-    .await
-    .context("failed to start jadx-bridge sidecar")?;
+    };
 
-    tracing::info!(
-        port = bridge_handle.port(),
-        apk = %apk.display(),
-        "jadx-bridge ready"
-    );
-
-    let server = JadxMcpServer::new(bridge_handle.client());
-    server::run_stdio(server, bridge_handle).await
+    let server = JadxMcpServer::new(spawn_template);
+    server::run_stdio(server, autoload_apk).await
 }
 
 fn probe() -> Result<()> {

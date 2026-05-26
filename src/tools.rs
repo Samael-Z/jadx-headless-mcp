@@ -6,6 +6,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct LoadApkReq {
+    /// Absolute path to the APK / DEX / AAB / XAPK / APKM / JAR to load. \
+    /// If another file is already loaded, it is unloaded first.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassNameReq {
     /// Fully qualified class name, e.g. "com.example.MainActivity".
     pub class_name: String,

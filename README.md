@@ -38,8 +38,10 @@ That's it — no Python, no Maven, no JADX installation needed by end users.
 If you have Node.js 18+:
 
 ```bash
-claude mcp add jadx -- npx -y jadx-headless-mcp --apk /absolute/path/to/your.apk
+claude mcp add jadx -- npx -y jadx-headless-mcp
 ```
+
+That's it. One MCP entry serves any APK — call the `load_apk` tool in conversation to point at whatever file you want to analyze, switch by calling it again. No need to edit config or restart Claude when switching files.
 
 The npm package is a thin shim that downloads the platform-specific binary (~52 MB) from the matching GitHub Release on first run and caches it locally. Subsequent runs skip the download.
 
@@ -72,15 +74,10 @@ cargo install --path . --locked
 ### Claude Code CLI
 
 ```bash
-claude mcp add jadx -- jadx-mcp --apk /absolute/path/to/your.apk
+claude mcp add jadx -- jadx-mcp
 ```
 
-To analyse different APKs in different scopes, register them with distinct names:
-
-```bash
-claude mcp add jadx-app -s project -- jadx-mcp --apk ./apks/app.apk
-claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
-```
+One config, any APK. Call the `load_apk` tool in conversation to point at a file; call it again with a different path to switch.
 
 ### Claude Desktop / Codex / generic stdio config
 
@@ -88,8 +85,7 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 {
   "mcpServers": {
     "jadx": {
-      "command": "jadx-mcp",
-      "args": ["--apk", "/absolute/path/to/your.apk"]
+      "command": "jadx-mcp"
     }
   }
 }
@@ -97,11 +93,21 @@ claude mcp add jadx-sample -s user -- jadx-mcp --apk ~/samples/sample.apk
 
 If `java` isn't on PATH for the Desktop app's environment, set `JADX_MCP_JAVA` or pass `--java /full/path/to/java`.
 
+### Working with the loaded APK
+
+After registering, just say:
+
+> Load `E:\\path\\to\\app.apk` and show me the package tree.
+
+Claude calls `load_apk` (~30 seconds for JADX to decompile, larger APKs longer), then `get_package_tree`. Switch APKs at any time:
+
+> Now switch to `D:\\samples\\other.apk` and find any class containing "encrypt".
+
 ### Useful flags / env
 
 | Flag | Env | Purpose |
 |---|---|---|
-| `--apk PATH` | `JADX_MCP_APK` | APK / DEX / AAB / XAPK / APKM / JAR to load. **Required** |
+| `--apk PATH` | `JADX_MCP_APK` | **Optional.** APK / DEX / AAB / XAPK / APKM / JAR to autoload on startup. Equivalent to calling `load_apk` immediately. Mostly useful for single-APK workflows |
 | `--java PATH` | `JADX_MCP_JAVA` | Override the Java executable. Default: `$JAVA_HOME/bin/java` then `PATH` |
 | `--bridge-jar PATH` | `JADX_MCP_BRIDGE_JAR` | Use a different bridge JAR (e.g. a local build). Default: bundled |
 | `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | Extra JVM flags. Default: `-Xmx2g`. Repeat for multiple |
@@ -111,10 +117,11 @@ If `java` isn't on PATH for the Desktop app's environment, set `JADX_MCP_JAVA` o
 
 ## Tools exposed
 
-Twenty-five tools across five categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
+Twenty-seven tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
 
 | Category | Tool |
 |---|---|
+| **Session** | `load_apk`, `current_apk` |
 | **Classes** | `get_all_classes`, `get_class_source`, `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword`, `get_cache_stats`, `clear_cache` |
 | **Methods** | `get_method_by_name`, `search_method_by_name` |
 | **Resources** | `get_android_manifest`, `get_strings`, `get_all_resource_file_names`, `get_resource_file` |
@@ -124,11 +131,13 @@ Twenty-five tools across five categories. Run `tools/list` from your client for 
 A typical analysis flow:
 
 ```
+load_apk { path: "/abs/path/to/app.apk" }         → point the server at an APK (~30s for jadx to load)
 get_package_tree                                  → see APK structure, find app package
 get_main_application_classes_names                → enumerate first-party classes
 get_class_source { class_name: "..." }            → read decompiled source
 get_xrefs_to_method { class_name, method_name }   → trace callers
 search_classes_by_keyword { search_term, ... }    → free-text search across packages
+load_apk { path: "/path/to/other.apk" }           → switch to a different APK in-session
 ```
 
 Renames are in-memory only — visible to subsequent tool calls in the same session, not persisted to disk.
