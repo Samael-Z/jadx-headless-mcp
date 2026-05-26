@@ -64,10 +64,16 @@ jobs:
             runner: ubuntu-24.04-arm
             archive: tar.gz
             asset_suffix: linux-arm64
+          # Both macOS targets build on macos-14 (Apple Silicon). Intel target is
+          # cross-compiled — macos-14 ships Xcode with both x86_64 and arm64 SDKs,
+          # and the Rust deps are pure-Rust (rustls, etc.) so no platform-specific
+          # C linking. macos-13 Intel runners have prohibitively long queues on
+          # the free tier; avoid them entirely.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             archive: tar.gz
             asset_suffix: macos-x86_64
+            cross_apple: "true"
           - target: aarch64-apple-darwin
             runner: macos-14
             archive: tar.gz
@@ -99,6 +105,8 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: cargo test
+        # Skip tests when cross-compiling — the produced binary can't run on the host.
+        if: matrix.cross_apple != 'true'
         env:
           BRIDGE_JAR_PATH: ${{ github.workspace }}/bridge/target/jadx-bridge.jar
         run: cargo test --release --locked --target ${{ matrix.target }}
