@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.zin.jadxhandless</groupId>
+    <artifactId>jadx-bridge</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <jadx.version>1.5.5</jadx.version>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>maven-central</id>
+            <url>https://repo1.maven.org/maven2</url>
+        </repository>
+        <repository>
+            <id>google-maven</id>
+            <url>https://maven.google.com</url>
+        </repository>
+        <repository>
+            <id>sonatype-releases</id>
+            <url>https://oss.sonatype.org/content/repositories/releases/</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <!--
+            Single jadx-all fat artifact: includes core + every input plugin + Android tooling
+            (r8, smali, bundletool). Avoids a tangle of transitive Google-Maven deps in our shaded jar.
+            Published as classifier `dex` on Maven Central.
+        -->
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-core</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-dex-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-java-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-smali-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-java-convert</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-aab-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-xapk-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-apkm-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-apks-input</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.skylot</groupId>
+            <artifactId>jadx-kotlin-metadata</artifactId>
+            <version>${jadx.version}</version>
+        </dependency>
+
+        <!-- HTTP server -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+            <version>6.7.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.17.2</version>
+        </dependency>
+
+        <!-- SLF4J impl so jadx logs go somewhere; simple binding writes to stderr -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.13</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>jadx-bridge</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>11</source>
+                    <target>11</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <minimizeJar>false</minimizeJar>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.zin.jadxhandless.JadxBridge</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
