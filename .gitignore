@@ -24,5 +24,12 @@ Thumbs.db
 /release/
 *.log
 
+# Credentials / secrets — must NEVER be committed.
+# .npmrc here is the local auth file dropped during manual `npm publish`;
+# CI uses GitHub Secrets instead. If you see this file appear in `git status`,
+# something has gone wrong — delete it before committing.
+.npmrc
+**/.npmrc
+
 # Vendored jar drop location (built locally; release uses CI artifact)
 src/embedded/jadx-bridge.jar
