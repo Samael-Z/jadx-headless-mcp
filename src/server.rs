@@ -58,6 +58,11 @@ impl JadxMcpServer {
                 path.display()
             )));
         }
+        // Canonicalize so relative paths and `..` segments don't surprise the user
+        // later when `current_apk` reports a confusing path. `is_file()` already
+        // succeeded, so canonicalize() shouldn't fail — but if it does (e.g.,
+        // symlink loops), fall back to the original path rather than refusing to load.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
 
         // Spawn the new bridge BEFORE shutting down the old one. If the spawn
         // fails, the current bridge keeps serving tool calls instead of leaving

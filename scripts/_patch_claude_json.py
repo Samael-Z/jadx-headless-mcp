@@ -15,15 +15,15 @@ from pathlib import Path
 
 CONFIG = Path.home() / ".claude.json"
 SERVER_NAME = "jadx-headless-mcp"
-APK_PATH = r"E:\DEV\handlessJADX\apks\com.sdu.didi.gsui_9.3.0.apk"
 
+# v0.3.0+ supports runtime `load_apk` tool calls, so no --apk in the launch
+# args. One MCP entry serves any APK. To switch files: in conversation, say
+# "load <path>" and Claude will call the load_apk tool.
 ENTRY = {
     "command": "npx",
     "args": [
         "-y",
         "jadx-headless-mcp",
-        "--apk",
-        APK_PATH,
     ],
 }
 

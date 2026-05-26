@@ -41,11 +41,18 @@ public final class XrefsRoutes {
                 return;
             }
             ClassNode node = target.getClassNode();
+            if (node == null) {
+                Errors.send(ctx, 500, "Class " + className + " has no backing ClassNode (synthetic?)", logger);
+                return;
+            }
             List<ClassNode> classRefs = new ArrayList<>(node.getUseIn());
             List<MethodNode> methodRefs = new ArrayList<>(node.getUseInMth());
             for (JavaMethod jm : target.getMethods()) {
                 if (jm.isConstructor()) {
-                    methodRefs.addAll(jm.getMethodNode().getUseIn());
+                    // getMethodNode() can return null for synthetic/bridge methods —
+                    // skip those instead of NPE.
+                    MethodNode mn = jm.getMethodNode();
+                    if (mn != null) methodRefs.addAll(mn.getUseIn());
                 }
             }
 
@@ -94,6 +101,10 @@ public final class XrefsRoutes {
         String className = require(ctx, "class_name");
         String methodName = require(ctx, "method_name");
         if (className == null || methodName == null) return;
+        // Optional descriptor to disambiguate overloads. If absent, references from
+        // all overloads are merged. Old code merged ALL by accident (it picked the
+        // first match) which silently lost callers of other overloads.
+        String descriptor = ctx.queryParam("descriptor");
         try {
             JavaClass cls = find(className);
             if (cls == null) {
@@ -103,11 +114,20 @@ public final class XrefsRoutes {
             List<JavaMethod> matched = new ArrayList<>();
             String simple = cls.getName();
             for (JavaMethod m : cls.getMethods()) {
-                if (!m.isConstructor() && m.getName().equals(methodName)) matched.add(m);
-                else if (m.isConstructor() && methodName.equals(simple)) matched.add(m);
+                boolean nameMatch = (!m.isConstructor() && m.getName().equals(methodName))
+                        || (m.isConstructor() && methodName.equals(simple));
+                if (!nameMatch) continue;
+                if (descriptor != null && !descriptor.isEmpty()
+                        && !ClassRoutes.safeDescriptor(m).equals(descriptor)) {
+                    continue;
+                }
+                matched.add(m);
             }
             if (matched.isEmpty()) {
-                Errors.send(ctx, 404, "Method " + methodName + " not in " + cls.getFullName(), logger);
+                Errors.send(ctx, 404, "Method " + methodName + " not in " + cls.getFullName()
+                        + (descriptor != null && !descriptor.isEmpty()
+                                ? " (with descriptor " + descriptor + ")"
+                                : ""), logger);
                 return;
             }
             List<JavaMethod> related = new ArrayList<>();
@@ -117,10 +137,20 @@ public final class XrefsRoutes {
                 }
             }
             List<MethodNode> allRefs = new ArrayList<>();
+            int overloadsMatched = matched.size();
             for (JavaMethod jm : related) {
-                allRefs.addAll(jm.getMethodNode().getUseIn());
+                MethodNode mn = jm.getMethodNode();
+                if (mn != null) allRefs.addAll(mn.getUseIn());
             }
-            ctx.json(Pagination.paginate(ctx, collect(allRefs), "xrefs", "references", r -> r));
+            Map<String, Object> paginated = Pagination.paginate(
+                    ctx, collect(allRefs), "xrefs", "references", r -> r);
+            if (overloadsMatched > 1) {
+                paginated.put("matched_overloads", overloadsMatched);
+                paginated.put("hint",
+                        "Multiple overloads of `" + methodName + "` matched. " +
+                        "Pass `descriptor` to scope to one — see get_methods_of_class for descriptors.");
+            }
+            ctx.json(paginated);
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to find method references: " + e.getMessage(), e, logger);
         }
@@ -148,6 +178,10 @@ public final class XrefsRoutes {
                 return;
             }
             FieldNode fn = field.getFieldNode();
+            if (fn == null) {
+                Errors.send(ctx, 500, "Field " + fieldName + " has no backing FieldNode", logger);
+                return;
+            }
             List<MethodNode> refs = fn.getUseIn();
             ctx.json(Pagination.paginate(ctx, collect(refs), "xrefs", "references", r -> r));
         } catch (Exception e) {
@@ -167,10 +201,7 @@ public final class XrefsRoutes {
     }
 
     private JavaClass find(String fullName) {
-        for (JavaClass cls : context.getClassesWithInners()) {
-            if (cls.getFullName().equals(fullName)) return cls;
-        }
-        return null;
+        return context.findClassByFqn(fullName);
     }
 
     private List<JavaMethod> methodWithOverrides(JavaMethod m) {

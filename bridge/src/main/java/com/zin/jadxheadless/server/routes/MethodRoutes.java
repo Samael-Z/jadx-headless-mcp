@@ -8,6 +8,7 @@ import jadx.api.JavaMethod;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,14 @@ public final class MethodRoutes {
         this.context = context;
     }
 
+    /**
+     * Returns every method matching the given name. Java has overloading, so this
+     * may return multiple entries (same name, different descriptors). Callers that
+     * need a specific one can disambiguate with the `descriptor` field.
+     *
+     * Matching is CASE-SENSITIVE — `getFoo` and `getfoo` are different methods in
+     * Java. Old code did equalsIgnoreCase here; that conflated distinct methods.
+     */
     public void handleMethodByName(Context ctx) {
         String methodName = ctx.queryParam("method_name");
         if (methodName == null || methodName.isEmpty()) {
@@ -30,30 +39,49 @@ public final class MethodRoutes {
             return;
         }
         String className = ctx.queryParam("class_name");
+        String descriptor = ctx.queryParam("descriptor");
 
         try {
             List<JavaClass> classes = context.getClassesWithInners();
-            if (className == null || className.isEmpty()) {
-                for (JavaClass cls : classes) {
-                    for (JavaMethod m : cls.getMethods()) {
-                        if (m.getName().equalsIgnoreCase(methodName)) {
-                            ctx.json(buildMethodResult(cls, m));
-                            return;
-                        }
-                    }
+            List<Map<String, Object>> overloads = new ArrayList<>();
+            for (JavaClass cls : classes) {
+                if (className != null && !className.isEmpty() && !cls.getFullName().equals(className)) {
+                    continue;
                 }
-            } else {
-                for (JavaClass cls : classes) {
-                    if (!cls.getFullName().equals(className)) continue;
-                    for (JavaMethod m : cls.getMethods()) {
-                        if (m.getName().equalsIgnoreCase(methodName)) {
-                            ctx.json(buildMethodResult(cls, m));
-                            return;
-                        }
+                for (JavaMethod m : cls.getMethods()) {
+                    if (!m.getName().equals(methodName)) continue;
+                    String desc = ClassRoutes.safeDescriptor(m);
+                    if (descriptor != null && !descriptor.isEmpty() && !desc.equals(descriptor)) {
+                        continue;
                     }
+                    overloads.add(buildMethodResult(cls, m, desc));
+                }
+                // When class_name is specified, no need to keep scanning other classes.
+                if (className != null && !className.isEmpty() && !overloads.isEmpty()) {
+                    break;
                 }
             }
-            Errors.send(ctx, 404, "Method not found: " + methodName, logger);
+
+            if (overloads.isEmpty()) {
+                Errors.send(ctx, 404, "Method not found: " + methodName
+                        + (className != null && !className.isEmpty() ? " in " + className : ""), logger);
+                return;
+            }
+
+            // Backward-compatible response: if exactly one match, return its fields at
+            // the top level (the v0.3.0 shape). Otherwise return a `overloads` array.
+            if (overloads.size() == 1) {
+                ctx.json(overloads.get(0));
+            } else {
+                Map<String, Object> out = new HashMap<>();
+                out.put("query", methodName);
+                out.put("class_name", className);
+                out.put("overload_count", overloads.size());
+                out.put("overloads", overloads);
+                out.put("hint", "Multiple overloads found. Pass `descriptor` (e.g. " +
+                        overloads.get(0).get("descriptor") + ") to disambiguate.");
+                ctx.json(out);
+            }
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to fetch method: " + e.getMessage(), e, logger);
         }
@@ -83,13 +111,14 @@ public final class MethodRoutes {
         }
     }
 
-    private Map<String, Object> buildMethodResult(JavaClass cls, JavaMethod m) {
+    private Map<String, Object> buildMethodResult(JavaClass cls, JavaMethod m, String descriptor) {
         Map<String, Object> out = new HashMap<>();
         out.put("class_name", cls.getFullName());
         out.put("method_name", m.getName());
         out.put("full_name", cls.getFullName() + "." + m.getName());
         out.put("return_type", String.valueOf(m.getReturnType()));
         out.put("is_constructor", m.isConstructor());
+        out.put("descriptor", descriptor);
         out.put("declaration", String.valueOf(m.getCodeNodeRef()));
         try {
             out.put("code", m.getCodeStr());

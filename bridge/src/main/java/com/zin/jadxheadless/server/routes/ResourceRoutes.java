@@ -42,6 +42,17 @@ public final class ResourceRoutes {
         }
     }
 
+    /**
+     * Match {@code res/values}-prefixed, {@code strings.xml}-suffixed paths —
+     * both the default {@code res/values/strings.xml} AND locale variants like
+     * {@code res/values-zh-rCN/strings.xml}. Previous code only matched the
+     * default, hiding most translations on i18n apps.
+     */
+    private static boolean isStringsXml(String name) {
+        if (name == null) return false;
+        return name.startsWith("res/values") && name.endsWith("/strings.xml");
+    }
+
     public void handleStrings(Context ctx) {
         try {
             List<Map<String, String>> entries = new ArrayList<>();
@@ -50,11 +61,11 @@ public final class ResourceRoutes {
                     String name = resFile.getDeobfName();
                     if ("resources.arsc".equals(name)) {
                         for (ResContainer sub : resFile.loadContent().getSubFiles()) {
-                            if ("res/values/strings.xml".equals(sub.getFileName())) {
+                            if (isStringsXml(sub.getFileName())) {
                                 entries.add(Map.of("file", sub.getFileName(), "content", sub.getText().getCodeStr()));
                             }
                         }
-                    } else if ("res/values/strings.xml".equals(name)) {
+                    } else if (isStringsXml(name)) {
                         entries.add(Map.of("file", name, "content", resFile.loadContent().getText().getCodeStr()));
                     }
                 } catch (Exception inner) {
@@ -62,7 +73,7 @@ public final class ResourceRoutes {
                 }
             }
             if (entries.isEmpty()) {
-                Errors.send(ctx, 404, "No strings.xml found", logger);
+                Errors.send(ctx, 404, "No strings.xml found (looked for res/values*/strings.xml)", logger);
                 return;
             }
             ctx.json(Pagination.paginate(ctx, entries, "resource/strings-xml", "strings", x -> x));
@@ -73,7 +84,11 @@ public final class ResourceRoutes {
 
     public void handleListAllResourceFilesNames(Context ctx) {
         try {
-            List<String> names = new ArrayList<>();
+            // LinkedHashSet — preserves insertion order, drops duplicates. Without
+            // the dedup, files that appear both as standalone resources AND inside
+            // resources.arsc showed up twice; "resources.arsc" itself was also
+            // listed alongside its expanded sub-files (missing `continue` bug).
+            java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
             for (ResourceFile resFile : context.jadx().getResources()) {
                 try {
                     String n = resFile.getDeobfName();
@@ -81,6 +96,9 @@ public final class ResourceRoutes {
                         for (ResContainer sub : resFile.loadContent().getSubFiles()) {
                             names.add(sub.getFileName());
                         }
+                        // Don't list the arsc archive itself — callers want logical
+                        // resource paths, not the bundle container.
+                        continue;
                     }
                     names.add(n);
                 } catch (Exception inner) {
@@ -91,7 +109,8 @@ public final class ResourceRoutes {
                 Errors.send(ctx, 404, "No resources found", logger);
                 return;
             }
-            ctx.json(Pagination.paginate(ctx, names, "application-resources", "files", x -> x));
+            ctx.json(Pagination.paginate(ctx, new ArrayList<>(names),
+                    "application-resources", "files", x -> x));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to list resources: " + e.getMessage(), e, logger);
         }

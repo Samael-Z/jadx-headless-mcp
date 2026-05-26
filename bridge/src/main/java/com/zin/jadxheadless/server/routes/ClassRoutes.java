@@ -108,8 +108,17 @@ public final class ClassRoutes {
                 row.put("name", m.getName());
                 row.put("full_name", cls.getFullName() + "." + m.getName());
                 row.put("return_type", String.valueOf(m.getReturnType()));
-                row.put("access_flags", m.getAccessFlags());
+                // String.valueOf — not the raw AccessInfo object. The AccessInfo has a
+                // self-referential `visibility` field that trips Jackson's max nesting
+                // depth (1000) and 500s the request on certain classes (e.g. annotations
+                // or classes with deep modifier hierarchies). The stringified form
+                // ("public static" etc.) is what consumers actually want anyway.
+                row.put("access_flags", String.valueOf(m.getAccessFlags()));
                 row.put("is_constructor", m.isConstructor());
+                // Tee up the method descriptor (parameter types) — without it, overloaded
+                // methods are indistinguishable. Callers use this when there are multiple
+                // methods with the same name.
+                row.put("descriptor", safeDescriptor(m));
                 methods.add(row);
             }
             ctx.json(Map.of("class", cls.getFullName(), "methods", methods));
@@ -132,7 +141,8 @@ public final class ClassRoutes {
                 Map<String, Object> row = new HashMap<>();
                 row.put("name", f.getName());
                 row.put("type", String.valueOf(f.getType()));
-                row.put("access_flags", f.getAccessFlags());
+                // String.valueOf — same AccessInfo cycle gotcha as in handleMethodsOfClass.
+                row.put("access_flags", String.valueOf(f.getAccessFlags()));
                 fields.add(row);
             }
             ctx.json(Map.of("class", cls.getFullName(), "fields", fields));
@@ -182,10 +192,19 @@ public final class ClassRoutes {
                 Errors.send(ctx, 404, "Main activity class not found: " + results.getMainActivity(), logger);
                 return;
             }
+            // Decompile inside its own try — some classes (especially obfuscated /
+            // synthetic launchers) can throw during decompile; we still want to
+            // return the FQN even if the source is unavailable.
+            String code;
+            try {
+                code = decompiledCode(main);
+            } catch (Throwable t) {
+                code = "// Failed to decompile " + main.getFullName() + ": " + t.getMessage();
+            }
             ctx.json(Map.of(
                     "name", main.getFullName(),
                     "type", "code/java",
-                    "content", decompiledCode(main)));
+                    "content", code));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to resolve main activity: " + e.getMessage(), e, logger);
         }
@@ -269,22 +288,52 @@ public final class ClassRoutes {
                 String pkg = dot > 0 ? full.substring(0, dot) : "(default)";
                 counts.merge(pkg, 1, Integer::sum);
             }
-            List<Map<String, Object>> packages = counts.entrySet().stream()
+            List<Map.Entry<String, Integer>> sorted = counts.entrySet().stream()
                     .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
-                    .map(e -> {
-                        Map<String, Object> row = new HashMap<>();
-                        row.put("name", e.getKey());
-                        row.put("class_count", e.getValue());
-                        row.put("is_likely_library", isLikelyLibrary(e.getKey()));
-                        return row;
-                    })
                     .collect(Collectors.toList());
-            ctx.json(Map.of(
-                    "total_classes", all.size(),
-                    "total_packages", packages.size(),
-                    "packages", packages));
+
+            // Paginate to keep responses below MCP client token limits — a real-world
+            // 100k-class APK has 20k+ packages and the un-paginated response was 2 MB+.
+            // Default page size 50 unless caller overrides via ?count=.
+            int defaultCount = 50;
+            int offset = parsePositive(ctx, "offset", 0);
+            int count = parsePositive(ctx, "count", defaultCount);
+
+            int total = sorted.size();
+            int from = Math.min(offset, total);
+            int to = count <= 0 ? total : Math.min(from + count, total);
+            List<Map<String, Object>> page = new ArrayList<>(Math.max(0, to - from));
+            for (int i = from; i < to; i++) {
+                Map.Entry<String, Integer> e = sorted.get(i);
+                Map<String, Object> row = new HashMap<>();
+                row.put("name", e.getKey());
+                row.put("class_count", e.getValue());
+                row.put("is_likely_library", isLikelyLibrary(e.getKey()));
+                page.add(row);
+            }
+            Map<String, Object> out = new HashMap<>();
+            out.put("type", "package-tree");
+            out.put("total_classes", all.size());
+            out.put("total_packages", total);
+            out.put("offset", from);
+            out.put("count", count);
+            out.put("returned", page.size());
+            out.put("has_more", to < total);
+            out.put("packages", page);
+            ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to build package tree: " + e.getMessage(), e, logger);
+        }
+    }
+
+    private static int parsePositive(Context ctx, String key, int fallback) {
+        String raw = ctx.queryParam(key);
+        if (raw == null || raw.isEmpty()) return fallback;
+        try {
+            int v = Integer.parseInt(raw);
+            return v < 0 ? fallback : v;
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 
@@ -309,10 +358,7 @@ public final class ClassRoutes {
     }
 
     private JavaClass findClass(String fullName) {
-        for (JavaClass cls : context.getClassesWithInners()) {
-            if (cls.getFullName().equals(fullName)) return cls;
-        }
-        return null;
+        return context.findClassByFqn(fullName);
     }
 
     private String decompiledCode(JavaClass cls) {
@@ -437,5 +483,19 @@ public final class ClassRoutes {
             if (pkg.startsWith(prefix)) return true;
         }
         return false;
+    }
+
+    /**
+     * Best-effort method descriptor (parameter type list). Falls back to "" if jadx
+     * doesn't expose it cleanly — never throws, since this is metadata enrichment.
+     */
+    static String safeDescriptor(JavaMethod m) {
+        try {
+            jadx.core.dex.nodes.MethodNode mn = m.getMethodNode();
+            if (mn == null) return "";
+            return String.valueOf(mn.getMethodInfo().getShortId());
+        } catch (Throwable t) {
+            return "";
+        }
     }
 }
