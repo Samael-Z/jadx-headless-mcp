@@ -1,0 +1,175 @@
+name: build
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Step 1: build the Java sidecar once. Cross-arch by design — Java bytecode.
+  # The resulting jar is uploaded as an artifact that every Rust matrix job downloads.
+  # ---------------------------------------------------------------------------
+  bridge:
+    name: build bridge jar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Build jadx-bridge.jar
+        run: |
+          cd bridge
+          mvn -q -B -DskipTests package
+          ls -lh target/jadx-bridge.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jadx-bridge-jar
+          path: bridge/target/jadx-bridge.jar
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Step 2: build the Rust binary for each target. The bundled jar is downloaded
+  # via the BRIDGE_JAR_PATH env var picked up by build.rs.
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.target }}
+    needs: bridge
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub-hosted runner labels reference:
+          #   https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners
+          # ARM Linux uses the dedicated `ubuntu-24.04-arm` runner (not `ubuntu-latest-arm64`).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+            asset_suffix: linux-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            asset_suffix: macos-x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            asset_suffix: macos-arm64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            asset_suffix: windows-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jadx-bridge-jar
+          path: bridge/target/
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: cargo build --release
+        env:
+          BRIDGE_JAR_PATH: ${{ github.workspace }}/bridge/target/jadx-bridge.jar
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: cargo test
+        env:
+          BRIDGE_JAR_PATH: ${{ github.workspace }}/bridge/target/jadx-bridge.jar
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="jadx-handless-mcp-${{ matrix.asset_suffix }}"
+          mkdir -p "$stage"
+          if [[ "${{ matrix.runner }}" == windows-* ]]; then
+            cp "target/${{ matrix.target }}/release/jadx-mcp.exe" "$stage/"
+          else
+            cp "target/${{ matrix.target }}/release/jadx-mcp" "$stage/"
+          fi
+          cp README.md LICENSE "$stage/" 2>/dev/null || true
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "$stage.zip" "$stage" >/dev/null
+            echo "asset=$stage.zip" >> $GITHUB_ENV
+          else
+            tar -czf "$stage.tar.gz" "$stage"
+            echo "asset=$stage.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jadx-handless-mcp-${{ matrix.asset_suffix }}
+          path: ${{ env.asset }}
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Step 3: on a v* tag, gather every artifact and publish a GitHub Release.
+  # We use `always()` + a `success()` check on the matrix so a partial release
+  # (some platforms missing) is still published — users get binaries for the
+  # platforms that did build, and the release notes show which jobs failed.
+  # ---------------------------------------------------------------------------
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v') && always()
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: bail out if no platform artifacts exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No platform archives produced — every matrix job failed. Aborting release." >&2
+            exit 1
+          fi
+          echo "Found ${#archives[@]} platform archive(s):"
+          ls -la dist/
+      - name: checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: false
