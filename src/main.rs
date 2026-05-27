@@ -40,7 +40,8 @@ struct Cli {
     #[arg(long, env = "JADX_MCP_BRIDGE_JAR", global = true)]
     bridge_jar: Option<PathBuf>,
 
-    /// Extra JVM flags (e.g. "-Xmx4g"). May be passed multiple times.
+    /// Extra JVM flags (e.g. "-Xmx4g"). May be passed multiple times. Passing
+    /// your own -Xmx overrides the 2g default heap; other flags are additive.
     #[arg(long = "jvm-arg", env = "JADX_MCP_JVM_ARGS", value_delimiter = ' ', global = true)]
     jvm_args: Vec<String>,
 

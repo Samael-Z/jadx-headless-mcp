@@ -48,7 +48,7 @@ npm 包是一个轻壳脚本，首次运行时从对应版本的 GitHub Release 
 > **为什么要 `@latest`？** 不带版本号的 `npx -y jadx-headless-mcp` 会**永远复用首次下载的版本**，不会主动去 npm registry 检查新版本 —— 这是 npx 的设计，不是本包的 bug。两种保持新版的写法：
 >
 > - `npx -y jadx-headless-mcp@latest` —— 每次启动都问一下 registry（启动多几百毫秒，但永远跟最新）。**推荐配置**。
-> - `npx -y jadx-headless-mcp@0.3.1` —— 锁死某个具体版本，要升级时手动改配置。可控性更高。
+> - `npx -y jadx-headless-mcp@0.3.2` —— 锁死某个具体版本，要升级时手动改配置。可控性更高。
 >
 > 如果你已经用裸 `jadx-headless-mcp`（无 `@latest`）注册过，想现在就升级，需要顺带清掉缓存：Windows 跑 `rm -rf "$LOCALAPPDATA/jadx-headless-mcp-npm"`，Linux/macOS 跑 `rm -rf ~/.cache/jadx-headless-mcp-npm`，然后重启 Claude Code。
 

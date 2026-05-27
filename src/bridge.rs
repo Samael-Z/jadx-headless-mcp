@@ -64,14 +64,17 @@ pub struct Bridge {
 
 impl Bridge {
     pub async fn spawn(cfg: SpawnConfig) -> Result<Self> {
-        // Args: -Xss2m and -Xmx2g default. JVM args override.
+        // Default max heap of 2g unless the user supplies their own -Xmx via
+        // --jvm-arg / JADX_MCP_JVM_ARGS. The default is a *baseline*: user args
+        // are always passed through, so `--jvm-arg -Xss2m` keeps -Xmx2g, while
+        // `--jvm-arg -Xmx4g` overrides the heap. Without an explicit -Xmx we
+        // never want to fall back to the JVM's tiny default.
         let mut cmd = Command::new(&cfg.java_bin);
-        if cfg.jvm_args.is_empty() {
+        if !cfg.jvm_args.iter().any(|a| a.starts_with("-Xmx")) {
             cmd.arg("-Xmx2g");
-        } else {
-            for a in &cfg.jvm_args {
-                cmd.arg(a);
-            }
+        }
+        for a in &cfg.jvm_args {
+            cmd.arg(a);
         }
         cmd.arg("-jar")
             .arg(&cfg.bridge_jar)

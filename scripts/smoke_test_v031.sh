@@ -10,7 +10,7 @@
 set -euo pipefail
 
 apk="E:/DEV/handlessJADX/apks/com.sdu.didi.gsui_9.3.0.apk"
-exe="E:/DEV/handlessJADX/jadx-handless-mcp/target/release/jadx-mcp.exe"
+exe="E:/DEV/handlessJADX/jadx-headless-mcp/target/release/jadx-mcp.exe"
 
 stdout_log="/tmp/v031_stdout.$$"
 stderr_log="/tmp/v031_stderr.$$"
