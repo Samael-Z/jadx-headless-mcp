@@ -117,10 +117,36 @@ Claude 会调 `load_apk`（首次约 30 秒，jadx 反编译耗时；APK 越大�
 | `--apk PATH` | `JADX_MCP_APK` | **可选。** 启动时自动加载的 APK。等价于立刻调一次 `load_apk`。如果只分析一个 APK 可以用，多 APK 场景不推荐 |
 | `--java PATH` | `JADX_MCP_JAVA` | 覆盖 Java 可执行文件路径。默认顺序：`$JAVA_HOME/bin/java` → `PATH` |
 | `--bridge-jar PATH` | `JADX_MCP_BRIDGE_JAR` | 使用其他 bridge JAR（比如本地构建的）。默认用内嵌的 |
-| `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | 额外的 JVM 参数。默认 `-Xmx2g`。可以多次指定 |
+| `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | 额外的 JVM 参数。默认堆 `-Xmx2g`（作为基线；你自己传的 `-Xmx` 会覆盖它）。命令行要用 `=` 写法（`--jvm-arg=-Xmx4g`）；环境变量里多个参数用空格分隔。详见下方[配置 JVM 内存](#配置-jvm-内存) |
 | `--bridge-startup-secs N` | — | 等待 bridge 完成 APK 加载的超时秒数。默认 600 |
 | `--bridge-host`, `--bridge-port` | — | 覆盖 bridge 的回环监听地址。默认 `127.0.0.1:0`（OS 自动分配） |
 | — | `JADX_MCP_LOG` | `tracing` 过滤器，比如 `debug,reqwest=warn`。默认 `info` |
+
+### 配置 JVM 内存
+
+bridge 的 JVM 默认最大堆为 **2 GB**（`-Xmx2g`）。分析超大 APK 时，可以通过 `JADX_MCP_JVM_ARGS` 或 `--jvm-arg` 调大。
+
+在 MCP 配置里最干净的方式是用 `env` 块：
+
+```json
+{
+  "mcpServers": {
+    "jadx": {
+      "command": "npx",
+      "args": ["-y", "jadx-headless-mcp@latest"],
+      "env": { "JADX_MCP_JVM_ARGS": "-Xmx4g" }
+    }
+  }
+}
+```
+
+命令行上要用 `=` 写法——用空格（`--jvm-arg -Xmx4g`）会让解析器把 `-Xmx4g` 当成另一个 flag 而报错：
+
+```bash
+jadx-mcp --jvm-arg=-Xmx4g
+```
+
+2 GB 是**基线默认值**：你传自己的 `-Xmx` 会覆盖堆大小，其他参数则是叠加——比如 `JADX_MCP_JVM_ARGS="-Xmx4g -Xss2m"` 会保留 4 GB 堆并加上 2 MB 线程栈。多个参数用空格分隔。
 
 ## 暴露的工具
 

@@ -117,10 +117,36 @@ Claude calls `load_apk` (~30 seconds for JADX to decompile, larger APKs longer),
 | `--apk PATH` | `JADX_MCP_APK` | **Optional.** APK / DEX / AAB / XAPK / APKM / JAR to autoload on startup. Equivalent to calling `load_apk` immediately. Mostly useful for single-APK workflows |
 | `--java PATH` | `JADX_MCP_JAVA` | Override the Java executable. Default: `$JAVA_HOME/bin/java` then `PATH` |
 | `--bridge-jar PATH` | `JADX_MCP_BRIDGE_JAR` | Use a different bridge JAR (e.g. a local build). Default: bundled |
-| `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | Extra JVM flags. Default: `-Xmx2g`. Repeat for multiple |
+| `--jvm-arg ARG` | `JADX_MCP_JVM_ARGS` | Extra JVM flags. Default heap `-Xmx2g` (a baseline; your own `-Xmx` overrides it). On the CLI use the `=` form (`--jvm-arg=-Xmx4g`); space-separate multiple flags in the env var. See [Configuring JVM heap](#configuring-jvm-heap-memory) below |
 | `--bridge-startup-secs N` | — | How long to wait for the bridge to finish loading the APK. Default: 600 |
 | `--bridge-host`, `--bridge-port` | — | Override the bridge's loopback bind. Default: `127.0.0.1:0` (OS-assigned) |
 | — | `JADX_MCP_LOG` | `tracing` filter, e.g. `debug,reqwest=warn`. Default: `info` |
+
+### Configuring JVM heap (memory)
+
+The bridge JVM defaults to a **2 GB** max heap (`-Xmx2g`). For very large APKs, raise it via `JADX_MCP_JVM_ARGS` or `--jvm-arg`.
+
+In an MCP config the cleanest way is an `env` block:
+
+```json
+{
+  "mcpServers": {
+    "jadx": {
+      "command": "npx",
+      "args": ["-y", "jadx-headless-mcp@latest"],
+      "env": { "JADX_MCP_JVM_ARGS": "-Xmx4g" }
+    }
+  }
+}
+```
+
+On the command line, use the `=` form — with a space (`--jvm-arg -Xmx4g`) the parser treats `-Xmx4g` as a separate flag and errors out:
+
+```bash
+jadx-mcp --jvm-arg=-Xmx4g
+```
+
+The 2 GB default is a **baseline**: passing your own `-Xmx` overrides the heap, while other flags are additive — e.g. `JADX_MCP_JVM_ARGS="-Xmx4g -Xss2m"` keeps a 4 GB heap and adds a 2 MB thread stack. Multiple flags are space-separated.
 
 ## Tools exposed
 
