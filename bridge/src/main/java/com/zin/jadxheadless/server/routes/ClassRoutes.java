@@ -297,11 +297,11 @@ public final class ClassRoutes {
             // Default page size 50 unless caller overrides via ?count=.
             int defaultCount = 50;
             int offset = parsePositive(ctx, "offset", 0);
-            int count = parsePositive(ctx, "count", defaultCount);
+            int requestedCount = parsePositive(ctx, "count", defaultCount);
 
             int total = sorted.size();
             int from = Math.min(offset, total);
-            int to = count <= 0 ? total : Math.min(from + count, total);
+            int to = requestedCount <= 0 ? total : Math.min(from + requestedCount, total);
             List<Map<String, Object>> page = new ArrayList<>(Math.max(0, to - from));
             for (int i = from; i < to; i++) {
                 Map.Entry<String, Integer> e = sorted.get(i);
@@ -316,7 +316,10 @@ public final class ClassRoutes {
             out.put("total_classes", all.size());
             out.put("total_packages", total);
             out.put("offset", from);
-            out.put("count", count);
+            // Mirror `returned` for consistency with Pagination.paginate — avoids
+            // the "count:0 returned:5" confusion when the caller asks for all.
+            out.put("count", page.size());
+            out.put("page_size", requestedCount);
             out.put("returned", page.size());
             out.put("has_more", to < total);
             out.put("packages", page);
@@ -334,6 +337,160 @@ public final class ClassRoutes {
             return v < 0 ? fallback : v;
         } catch (NumberFormatException e) {
             return fallback;
+        }
+    }
+
+    /**
+     * Find DEX string-pool constants ("foo") used in code. Distinct from
+     * {@code /search-classes-by-keyword} (which does case-insensitive substring
+     * matching across class/method/field/comment names) and {@code /strings}
+     * (which is res/values&#42;/strings.xml -- Android string resources, not
+     * DEX string constants).
+     *
+     * <p>Search source -- selectable via the {@code source} query parameter:
+     * <ul>
+     *   <li><b>smali</b> (default): scans the Dalvik smali listing for
+     *       {@code const-string vN, "<literal>"} opcodes. Authoritative,
+     *       independent of whether the class is decompilable. The right
+     *       choice for finding native-library loads, hardcoded URLs, or
+     *       API keys in R8/anti-tamper hardened classes (e.g. ByteDance,
+     *       Tencent) where the Java decompile is empty.</li>
+     *   <li><b>code</b>: scans jadx-decompiled Java source. Faster on big
+     *       APKs because decompile is cached, but returns 0 hits on classes
+     *       that jadx refuses to decompile.</li>
+     *   <li><b>both</b>: report a class if either source contains the
+     *       literal. The {@code matched_in} field tells you which.</li>
+     * </ul>
+     */
+    public void handleFindStringUsages(Context ctx) {
+        String literal = ctx.queryParam("literal");
+        if (literal == null || literal.isEmpty()) {
+            Errors.send(ctx, 400, "Missing required parameter 'literal'", logger);
+            return;
+        }
+        // For the code path: by default we look for a Java/Kotlin string
+        // constant -- i.e. wrapped in double quotes. quoted=false matches the
+        // raw substring (useful for regex fragments). The smali path always
+        // searches for the quoted form because smali const-string operands
+        // are always quoted.
+        String quotedParam = ctx.queryParam("quoted");
+        boolean quoted = quotedParam == null || !quotedParam.equalsIgnoreCase("false");
+        String caseParam = ctx.queryParam("case_sensitive");
+        boolean caseSensitive = caseParam == null || !caseParam.equalsIgnoreCase("false");
+        String packageFilter = ctx.queryParam("package");
+        boolean filterPkg = isValidPackageFilter(packageFilter);
+        String sourceParam = ctx.queryParam("source");
+        String source = (sourceParam == null || sourceParam.isEmpty())
+                ? "smali" : sourceParam.toLowerCase();
+        boolean useCode = source.equals("code") || source.equals("both");
+        boolean useSmali = source.equals("smali") || source.equals("both");
+        if (!useCode && !useSmali) {
+            Errors.send(ctx, 400,
+                    "Invalid 'source' parameter: expected 'smali' (default), 'code', or 'both'",
+                    logger);
+            return;
+        }
+
+        final String codeNeedle = quoted ? "\"" + literal + "\"" : literal;
+        final String codeHaystack = caseSensitive ? codeNeedle : codeNeedle.toLowerCase();
+        final String smaliNeedle = "\"" + literal + "\"";
+        final String smaliHaystack = caseSensitive ? smaliNeedle : smaliNeedle.toLowerCase();
+        final boolean cs = caseSensitive;
+        final boolean fSmali = useSmali;
+        final boolean fCode = useCode;
+
+        try {
+            List<JavaClass> all = context.getClassesWithInners();
+            List<Map<String, Object>> matches = all.parallelStream()
+                    .filter(c -> !filterPkg || matchesPackageFilter(c, packageFilter))
+                    .map(c -> findStringUsageInClass(
+                            c, fSmali, smaliNeedle, smaliHaystack,
+                            fCode, codeNeedle, codeHaystack, cs))
+                    .filter(java.util.Objects::nonNull)
+                    .collect(Collectors.toList());
+
+            ctx.json(Pagination.paginate(ctx, matches, "string-usages", "usages", x -> x));
+        } catch (Exception e) {
+            Errors.internal(ctx, "Find string usages failed: " + e.getMessage(), e, logger);
+        }
+    }
+
+    private Map<String, Object> findStringUsageInClass(
+            JavaClass c,
+            boolean useSmali, String smaliNeedle, String smaliHaystack,
+            boolean useCode, String codeNeedle, String codeHaystack,
+            boolean caseSensitive) {
+        try {
+            // smali first when requested: it works even for classes jadx
+            // can't decompile, and it carries const-string opcodes verbatim.
+            if (useSmali) {
+                String smali = safeSmali(c);
+                if (smali != null && !smali.isEmpty()) {
+                    Map<String, Object> hit = scanForLiteral(smali, smaliHaystack, caseSensitive);
+                    if (hit != null) {
+                        hit.put("class_name", c.getFullName());
+                        hit.put("matched_in", "smali");
+                        return hit;
+                    }
+                }
+            }
+            if (useCode) {
+                String code = decompiledCode(c);
+                if (code != null && !code.isEmpty()) {
+                    Map<String, Object> hit = scanForLiteral(code, codeHaystack, caseSensitive);
+                    if (hit != null) {
+                        hit.put("class_name", c.getFullName());
+                        hit.put("matched_in", "code");
+                        return hit;
+                    }
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Scan haystack for haystackNeedle (already cased to match the haystack
+     * casing policy). Returns an envelope with line/hits/snippet, or null if
+     * not found. The snippet uses the original haystack so casing is preserved.
+     */
+    private static Map<String, Object> scanForLiteral(
+            String haystack, String haystackNeedle, boolean caseSensitive) {
+        String hay = caseSensitive ? haystack : haystack.toLowerCase();
+        int idx = hay.indexOf(haystackNeedle);
+        if (idx < 0) return null;
+
+        int line = 1;
+        for (int i = 0; i < idx; i++) {
+            if (haystack.charAt(i) == '\n') line++;
+        }
+        int lineStart = haystack.lastIndexOf('\n', idx) + 1;
+        int lineEnd = haystack.indexOf('\n', idx);
+        if (lineEnd < 0) lineEnd = haystack.length();
+        String snippet = haystack.substring(lineStart, lineEnd).trim();
+
+        int hits = 0;
+        int p = 0;
+        while ((p = hay.indexOf(haystackNeedle, p)) >= 0) {
+            hits++;
+            p += haystackNeedle.length();
+        }
+
+        Map<String, Object> row = new HashMap<>();
+        row.put("line", line);
+        row.put("hits", hits);
+        row.put("snippet", snippet);
+        return row;
+    }
+
+    /** Wrap {@code getSmali()} -- some jadx versions throw on synthetic classes. */
+    private static String safeSmali(JavaClass c) {
+        try {
+            return c.getSmali();
+        } catch (Throwable t) {
+            return null;
         }
     }
 

@@ -32,6 +32,24 @@ public final class BridgeServer {
             cfg.jetty.defaultHost = host;
         });
 
+        // Global exception net. Without this, any RuntimeException raised by a
+        // handler (or a Jackson serialization failure on the response body)
+        // surfaces to the client as a bare HTTP 500 with an empty body --
+        // which the Rust shim then renders as "bridge returned HTTP 500:" with
+        // no actionable detail. Capture them all into a structured JSON envelope
+        // including the request path so callers can correlate.
+        app.exception(Exception.class, (e, ctx) -> {
+            logger.error("Unhandled exception on {} {}",
+                    ctx.method(), ctx.path(), e);
+            String msg = "Unhandled exception in " + ctx.method() + " " + ctx.path()
+                    + ": " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            ctx.status(500).json(java.util.Map.of(
+                    "error", msg,
+                    "status", 500,
+                    "cause", e.getClass().getName() + ": "
+                            + (e.getMessage() != null ? e.getMessage() : "")));
+        });
+
         ClassRoutes cls = new ClassRoutes(context);
         MethodRoutes mth = new MethodRoutes(context);
         ResourceRoutes res = new ResourceRoutes(context);
@@ -54,6 +72,7 @@ public final class BridgeServer {
         app.get("/main-application-classes-names", cls::handleMainApplicationClassesNames);
         app.get("/main-application-classes-code", cls::handleMainApplicationClassesCode);
         app.get("/search-classes-by-keyword", cls::handleSearchClassesByKeyword);
+        app.get("/find-string-usages", cls::handleFindStringUsages);
         app.get("/package-tree", cls::handlePackageTree);
         app.get("/cache-stats", cls::handleCacheStats);
         app.post("/cache-clear", cls::handleCacheClear);

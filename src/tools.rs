@@ -60,6 +60,39 @@ pub struct SearchClassesReq {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindStringUsagesReq {
+    /// The string literal to search for. By default this is matched against
+    /// the smali const-string opcodes of every class (authoritative; works
+    /// even for classes jadx cannot decompile).
+    pub literal: String,
+    /// Which source(s) to search:
+    /// - "smali" (default): scans `const-string vN, "<literal>"` opcodes.
+    ///   Works on R8/anti-tamper hardened classes whose decompile is empty.
+    /// - "code": scans jadx-decompiled Java/Kotlin source (faster on big
+    ///   APKs because decompile is cached, but returns 0 hits on hardened
+    ///   classes).
+    /// - "both": report classes matched by either source. `matched_in`
+    ///   in the response tells you which.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Code-path only. If false, match the raw substring instead of the
+    /// double-quoted form. Useful when looking for a regex component or a
+    /// string built by concatenation. Default: true.
+    #[serde(default)]
+    pub quoted: Option<bool>,
+    /// If false, match case-insensitively. Default: true.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    /// Optional package prefix filter (e.g. "com.example.app").
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResourceFileReq {
     /// Resource path inside the APK, e.g. "res/xml/network_security_config.xml".
     pub resource_name: String,

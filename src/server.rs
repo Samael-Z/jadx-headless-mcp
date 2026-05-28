@@ -305,6 +305,41 @@ impl JadxMcpServer {
         Ok(self.get("/search-classes-by-keyword", &q).await)
     }
 
+    #[tool(description = "Find which classes contain a DEX string constant. \
+                          Returns class FQN, line number of first hit, total hit count, code/smali \
+                          snippet, and which source matched (`matched_in`: 'smali' or 'code'). \
+                          \
+                          Default source is `smali` -- scans `const-string vN, \"<literal>\"` opcodes \
+                          across every class. This works even for R8/anti-tamper hardened classes \
+                          (ByteDance, Tencent, etc.) whose decompiled Java is empty. \
+                          Pass `source=code` for jadx-decompiled source search (faster, but blind to \
+                          hardened classes), or `source=both` for the union. \
+                          \
+                          This is the right tool when you need to find which class loads a native \
+                          library, calls a specific URL, or references a hardcoded API key. \
+                          NOT the same as `get_strings` (Android res/values*/strings.xml) or \
+                          `search_classes_by_keyword` (matches class/method/field/identifier names).")]
+    async fn find_string_usages(
+        &self,
+        Parameters(req): Parameters<FindStringUsagesReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![("literal", req.literal)];
+        if let Some(s) = req.source {
+            q.push(("source", s));
+        }
+        if let Some(b) = req.quoted {
+            q.push(("quoted", b.to_string()));
+        }
+        if let Some(b) = req.case_sensitive {
+            q.push(("case_sensitive", b.to_string()));
+        }
+        if let Some(p) = req.package {
+            q.push(("package", p));
+        }
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/find-string-usages", &q).await)
+    }
+
     #[tool(description = "Decompilation source cache statistics: hits, misses, hit_rate, cached_classes, compressed_mb.")]
     async fn get_cache_stats(&self) -> Result<CallToolResult, McpError> {
         Ok(self.get("/cache-stats", &[]).await)
@@ -347,7 +382,12 @@ impl JadxMcpServer {
         Ok(self.get("/manifest", &[]).await)
     }
 
-    #[tool(description = "Return all `res/values*/strings.xml` files in the APK (paginated).")]
+    #[tool(description = "Return all Android string RESOURCES — the contents of every \
+                          `res/values*/strings.xml` (default + locale variants) in the APK. \
+                          This is the i18n table that ships under res/ — NOT the DEX string pool. \
+                          If you want to find a hardcoded URL, native library name, or any string \
+                          literal used in code, use `find_string_usages` instead. \
+                          Paginated.")]
     async fn get_strings(
         &self,
         Parameters(req): Parameters<PaginationReq>,
