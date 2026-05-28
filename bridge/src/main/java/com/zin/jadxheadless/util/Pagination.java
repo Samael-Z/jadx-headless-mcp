@@ -15,15 +15,22 @@ import java.util.function.Function;
  * Returned envelope:
  * <pre>
  * {
- *   "type":     "&lt;label&gt;",         // free-form, helps callers tell collections apart
- *   "offset":   int,
- *   "count":    int,
- *   "total":    int,                  // total before paging
- *   "returned": int,                  // size of items
- *   "has_more": boolean,
- *   "items":    [ T... ]
+ *   "type":      "&lt;label&gt;",         // free-form, helps callers tell collections apart
+ *   "offset":    int,
+ *   "count":     int,                  // == returned; size of items in this page
+ *   "page_size": int,                  // page size the caller requested (0 = "all")
+ *   "total":     int,                  // total before paging
+ *   "returned":  int,                  // size of items (same value as count)
+ *   "has_more":  boolean,
+ *   "items":     [ T... ]
  * }
  * </pre>
+ *
+ * <p>Historical note: the {@code count} field used to echo the caller's
+ * requested page size verbatim, which produced confusing responses like
+ * {@code count:0, returned:5, total:5} when the caller asked for "all".
+ * It now mirrors {@code returned} so the number is always self-consistent;
+ * the original request value is preserved under {@code page_size}.</p>
  */
 public final class Pagination {
 
@@ -49,6 +56,7 @@ public final class Pagination {
             int count,
             Function<T, R> mapper) {
         if (offset < 0) offset = 0;
+        int requestedPageSize = Math.max(count, 0);
         int total = source.size();
         int from = Math.min(offset, total);
         int to = count <= 0 ? total : Math.min(from + count, total);
@@ -59,7 +67,11 @@ public final class Pagination {
         Map<String, Object> out = new HashMap<>();
         out.put("type", type);
         out.put("offset", from);
-        out.put("count", count);
+        // Mirror `returned` rather than the raw requested count: prevents the
+        // historical "count:0 returned:5" confusion when the caller asked for
+        // "all" (count<=0). The caller's original request lives in page_size.
+        out.put("count", items.size());
+        out.put("page_size", requestedPageSize);
         out.put("total", total);
         out.put("returned", items.size());
         out.put("has_more", to < total);

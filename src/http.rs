@@ -31,20 +31,7 @@ impl HttpClient {
     ) -> Result<serde_json::Value> {
         let url = self.base.join(path)?;
         let resp = self.client.get(url).query(params).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            // Try to parse as JSON error envelope; fall back to raw text.
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                return Ok(v);
-            }
-            anyhow::bail!("bridge returned HTTP {}: {}", status, body);
-        }
-        // Some bridge routes return raw text (e.g. class source). Wrap it.
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(serde_json::json!({ "content": body })),
-        }
+        decode_response(path, resp).await
     }
 
     pub async fn post_json<P: Serialize + ?Sized>(
@@ -54,17 +41,34 @@ impl HttpClient {
     ) -> Result<serde_json::Value> {
         let url = self.base.join(path)?;
         let resp = self.client.post(url).query(params).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                return Ok(v);
-            }
-            anyhow::bail!("bridge returned HTTP {}: {}", status, body);
+        decode_response(path, resp).await
+    }
+}
+
+async fn decode_response(path: &str, resp: reqwest::Response) -> Result<serde_json::Value> {
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        // Try to parse as JSON error envelope; fall back to raw text. If the
+        // body is empty (Jetty/Javalin can do that when an exception escapes
+        // the handler without going through our error helper), surface a
+        // pointer to the bridge log instead of "HTTP 500:" with nothing after.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            return Ok(v);
         }
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(serde_json::json!({ "content": body })),
+        if body.trim().is_empty() {
+            anyhow::bail!(
+                "bridge returned HTTP {} for {} with no body -- check the \
+                 bridge stderr log for the underlying exception",
+                status,
+                path
+            );
         }
+        anyhow::bail!("bridge returned HTTP {} for {}: {}", status, path, body);
+    }
+    // Some bridge routes return raw text (e.g. class source). Wrap it.
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(serde_json::json!({ "content": body })),
     }
 }
