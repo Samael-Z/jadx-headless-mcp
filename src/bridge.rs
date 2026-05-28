@@ -11,13 +11,21 @@
 
 use crate::http::HttpClient;
 use anyhow::{anyhow, Context, Result};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+
+/// Capacity of the ring buffer that captures bridge stderr during startup,
+/// so spawn failures can include the underlying JVM error (OOM, ClassNotFound,
+/// etc.) in their error message instead of a bare "exited before READY".
+const STDERR_TAIL_LINES: usize = 60;
 
 pub struct SpawnConfig {
     pub java_bin: PathBuf,
@@ -102,8 +110,14 @@ impl Bridge {
             .take()
             .ok_or_else(|| anyhow!("child has no stderr"))?;
 
-        // Forward stderr to our tracing pipeline in the background.
-        tokio::spawn(forward_stderr(stderr));
+        // Ring-buffer the last N stderr lines so a spawn failure can echo the
+        // real JVM error (OOM, ClassNotFound, JADX exception) back to the
+        // caller. Without this, the user sees only "exited before signaling
+        // READY" and has no signal for what's actually wrong.
+        let stderr_tail = Arc::new(StdMutex::new(VecDeque::<String>::with_capacity(
+            STDERR_TAIL_LINES,
+        )));
+        tokio::spawn(forward_stderr(stderr, Arc::clone(&stderr_tail)));
 
         let mut reader = BufReader::new(stdout).lines();
         let mut port: Option<u16> = None;
@@ -129,8 +143,9 @@ impl Bridge {
             Err(_) => {
                 let _ = child.kill().await;
                 return Err(anyhow!(
-                    "jadx-bridge did not become READY within {}s — check stderr above",
-                    cfg.startup_timeout_secs
+                    "jadx-bridge did not become READY within {}s.{}",
+                    cfg.startup_timeout_secs,
+                    format_stderr_tail(&stderr_tail)
                 ));
             }
             Ok(Err(e)) => {
@@ -141,8 +156,19 @@ impl Bridge {
         }
 
         if !ready {
-            let _ = child.kill().await;
-            return Err(anyhow!("jadx-bridge exited before signaling READY"));
+            // Reap the exit status (the child has already exited; this is
+            // primarily to surface it in the error). Then give the stderr
+            // forwarder one tick to flush its last lines so OOM/exception
+            // messages don't race the EOF on stdout out of the tail buffer.
+            let exit_status = child.wait().await.ok();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let exit_hint = exit_status
+                .map(|s| format!(" (exit status: {s})"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "jadx-bridge exited before signaling READY{exit_hint}.{}",
+                format_stderr_tail(&stderr_tail)
+            ));
         }
         let port = port.ok_or_else(|| anyhow!("jadx-bridge did not announce a PORT line"))?;
 
@@ -181,11 +207,41 @@ impl Bridge {
     }
 }
 
-async fn forward_stderr<R: tokio::io::AsyncRead + Unpin>(reader: R) {
+async fn forward_stderr<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    tail: Arc<StdMutex<VecDeque<String>>>,
+) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::info!(target: "bridge", "{}", line);
+        if let Ok(mut q) = tail.lock() {
+            if q.len() == STDERR_TAIL_LINES {
+                q.pop_front();
+            }
+            q.push_back(line);
+        }
     }
+}
+
+/// Render the captured stderr tail as a multi-line suffix for spawn-failure
+/// error messages. Returns an empty string when no stderr was captured, so
+/// the caller can unconditionally concatenate it.
+fn format_stderr_tail(tail: &Arc<StdMutex<VecDeque<String>>>) -> String {
+    let Ok(q) = tail.lock() else { return String::new() };
+    if q.is_empty() {
+        return " (no stderr captured)".to_string();
+    }
+    // Filter out the slf4j-simple INFO/DEBUG noise — the signal lives in
+    // lines that look like Java stack traces ("Exception", "Error", "at ").
+    // Keep the last 30 raw lines as well so OOM messages (which often
+    // arrive on plain "java.lang.OutOfMemoryError" lines) survive.
+    let mut out = String::from(" Last bridge stderr:\n");
+    for line in q.iter() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Locate the `java` binary. Lookup order: explicit override → JAVA_HOME → PATH.
