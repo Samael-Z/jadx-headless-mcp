@@ -118,6 +118,11 @@
                 <configuration>
                     <source>11</source>
                     <target>11</target>
+                    <!-- Force UTF-8 explicitly. project.build.sourceEncoding
+                         alone is not always honored (seen on Windows with a
+                         GBK platform encoding), so non-ASCII chars in javadoc
+                         or string literals would fail to compile. -->
+                    <encoding>UTF-8</encoding>
                 </configuration>
             </plugin>
             <plugin>
