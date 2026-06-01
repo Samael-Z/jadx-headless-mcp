@@ -57,6 +57,13 @@ pub struct SearchClassesReq {
     pub offset: Option<u32>,
     #[serde(default)]
     pub count: Option<u32>,
+    /// Wall-clock budget in milliseconds for code/comment scans (default 25000).
+    /// class/method/field name matching is fast and unaffected; code/comment
+    /// decompile every class, so on a huge APK they stop at this budget and
+    /// return partial results with `timed_out: true`. Prefer `search_in=class`
+    /// (fast) when you can; raise this only for exhaustive code sweeps.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -90,6 +97,13 @@ pub struct FindStringUsagesReq {
     pub offset: Option<u32>,
     #[serde(default)]
     pub count: Option<u32>,
+    /// Wall-clock budget in milliseconds for the scan (default 25000). On a
+    /// huge APK (100k+ classes) a full string scan can take minutes; instead of
+    /// blocking, the scan stops at this budget and returns whatever it found so
+    /// far with `timed_out: true` (and `scanned`/`total_classes` so you can see
+    /// coverage). Raise it for an exhaustive sweep, or just page with `offset`.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

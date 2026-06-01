@@ -68,6 +68,11 @@ pub struct Bridge {
     child: Mutex<Option<Child>>,
     port: u16,
     client: HttpClient,
+    /// Held open for the bridge's lifetime. We never write to it; its sole job
+    /// is to keep the child's stdin pipe open so the bridge's stdin-EOF watchdog
+    /// (`--exit-on-stdin-close`) only fires when THIS process actually dies.
+    /// Dropping this closes the pipe and asks the bridge to exit.
+    _child_stdin: StdMutex<Option<tokio::process::ChildStdin>>,
 }
 
 impl Bridge {
@@ -92,7 +97,13 @@ impl Bridge {
             .arg(&cfg.host)
             .arg("--port")
             .arg(cfg.port.to_string())
-            .stdin(Stdio::null())
+            // Orphan guard: the bridge exits when this stdin pipe reaches EOF.
+            // We pipe (and hold open) its stdin below; if THIS process dies —
+            // even via an ungraceful kill, where kill_on_drop never runs and
+            // Windows won't tear down the child — the OS closes the pipe and the
+            // bridge self-terminates instead of lingering as an orphan JVM.
+            .arg("--exit-on-stdin-close")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -100,6 +111,11 @@ impl Bridge {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn `java -jar {}`", cfg.bridge_jar.display()))?;
+
+        // Keep the child's stdin write-end alive for the bridge's lifetime (see
+        // `_child_stdin`). We never write to it — holding it open is what makes
+        // the orphan-guard fire only on parent death.
+        let child_stdin = child.stdin.take();
 
         let stdout = child
             .stdout
@@ -185,6 +201,7 @@ impl Bridge {
             child: Mutex::new(Some(child)),
             port,
             client,
+            _child_stdin: StdMutex::new(child_stdin),
         })
     }
 
@@ -197,6 +214,11 @@ impl Bridge {
     }
 
     pub async fn shutdown(&self) {
+        // Drop the stdin write-end first: this trips the bridge's stdin-EOF
+        // watchdog as a belt-and-suspenders companion to the explicit kill below.
+        if let Ok(mut s) = self._child_stdin.lock() {
+            s.take();
+        }
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             // kill_on_drop is set; we explicitly kill here too so logging is deterministic.

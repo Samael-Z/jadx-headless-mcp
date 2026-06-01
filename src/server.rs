@@ -301,6 +301,9 @@ impl JadxMcpServer {
         if let Some(s) = req.search_in {
             q.push(("search_in", s));
         }
+        if let Some(t) = req.timeout_ms {
+            q.push(("timeout_ms", t.to_string()));
+        }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/search-classes-by-keyword", &q).await)
     }
@@ -335,6 +338,9 @@ impl JadxMcpServer {
         }
         if let Some(p) = req.package {
             q.push(("package", p));
+        }
+        if let Some(t) = req.timeout_ms {
+            q.push(("timeout_ms", t.to_string()));
         }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/find-string-usages", &q).await)

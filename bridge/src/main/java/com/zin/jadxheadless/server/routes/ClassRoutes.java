@@ -29,6 +29,9 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -36,6 +39,16 @@ public final class ClassRoutes {
 
     private static final Logger logger = LoggerFactory.getLogger(ClassRoutes.class);
     private static final Pattern OBFUSCATED_PACKAGE_PATTERN = Pattern.compile("^p\\d+$");
+
+    /**
+     * Wall-clock budget for full-corpus scans (find-string-usages and code/comment
+     * keyword search). On a 100k+ class APK these scans decompile/generate-smali for
+     * every class and can run for minutes. Bounding them keeps the bridge responsive:
+     * a scan returns whatever it found within the budget plus {@code timed_out:true},
+     * instead of monopolizing the (serial) HTTP worker indefinitely. Override per
+     * request with {@code ?timeout_ms=}.
+     */
+    private static final long DEFAULT_SEARCH_TIMEOUT_MS = 25_000;
 
     /** Search modes for the keyword search route. */
     public enum SearchLocation { CLASS_NAME, METHOD_NAME, FIELD_NAME, CODE, COMMENT }
@@ -262,6 +275,10 @@ public final class ClassRoutes {
         }
         String packageFilter = ctx.queryParam("package");
         Set<SearchLocation> locations = parseSearchLocations(ctx.queryParam("search_in"));
+        long timeoutMs = parsePositiveLong(ctx, "timeout_ms", DEFAULT_SEARCH_TIMEOUT_MS);
+        int offset = parsePositive(ctx, "offset", 0);
+        int count = parsePositive(ctx, "count", parsePositive(ctx, "limit", 0));
+        int cap = count > 0 ? offset + count : 0;
 
         try {
             List<JavaClass> all = context.getClassesWithInners();
@@ -269,10 +286,56 @@ public final class ClassRoutes {
             boolean filterPkg = isValidPackageFilter(packageFilter);
 
             Set<JavaClass> matched = new LinkedHashSet<>();
+            boolean timedOut = false;
+            int scanned = 0;
+            // Precompiled once per request for the COMMENT scan -- compiling these per
+            // class across 100k+ classes would itself dominate runtime.
+            Pattern commentSingle = Pattern.compile("//.*?" + Pattern.quote(t) + ".*", Pattern.CASE_INSENSITIVE);
+            Pattern commentMulti = Pattern.compile("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", Pattern.DOTALL);
+
             for (SearchLocation loc : locations) {
-                matched.addAll(searchIn(all, t, loc, packageFilter, filterPkg));
+                // CLASS/METHOD/FIELD name matching is cheap string work (no decompile)
+                // -- the existing fast path returns in well under a second. CODE/COMMENT
+                // decompile every class, so they go through the time-bounded scan.
+                if (loc != SearchLocation.CODE && loc != SearchLocation.COMMENT) {
+                    matched.addAll(searchIn(all, t, loc, packageFilter, filterPkg));
+                    continue;
+                }
+                final SearchLocation floc = loc;
+                ScanResult<JavaClass> sr = boundedScan(all, timeoutMs, cap, c -> {
+                    if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
+                    String code;
+                    try {
+                        code = decompiledCode(c);
+                    } catch (Exception e) {
+                        return null;
+                    }
+                    if (code == null) return null;
+                    if (floc == SearchLocation.CODE) {
+                        return code.toLowerCase().contains(t) ? c : null;
+                    }
+                    if (commentSingle.matcher(code).find()) return c;
+                    java.util.regex.Matcher mm = commentMulti.matcher(code);
+                    while (mm.find()) {
+                        if (mm.group().toLowerCase().contains(t)) return c;
+                    }
+                    return null;
+                });
+                matched.addAll(sr.hits);
+                timedOut |= sr.timedOut;
+                scanned += sr.scanned;
             }
-            ctx.json(Pagination.paginate(ctx, new ArrayList<>(matched), "class-list", "classes", JavaClass::getFullName));
+            Map<String, Object> out = Pagination.paginate(
+                    new ArrayList<>(matched), "class-list", "classes", offset, count, JavaClass::getFullName);
+            if (timedOut) {
+                out.put("timed_out", true);
+                out.put("scanned", scanned);
+                out.put("total_classes", all.size());
+                out.put("has_more", true);
+                out.put("note", "Code/comment scan hit the " + timeoutMs
+                        + "ms budget; results are partial. Prefer search_in=class (fast) or narrow the query / raise ?timeout_ms=.");
+            }
+            ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Search failed: " + e.getMessage(), e, logger);
         }
@@ -340,6 +403,102 @@ public final class ClassRoutes {
         }
     }
 
+    private static long parsePositiveLong(Context ctx, String key, long fallback) {
+        String raw = ctx.queryParam(key);
+        if (raw == null || raw.isEmpty()) return fallback;
+        try {
+            long v = Long.parseLong(raw);
+            return v <= 0 ? fallback : v;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /** Outcome of a {@link #boundedScan}: collected hits plus progress/termination metadata. */
+    private static final class ScanResult<T> {
+        final List<T> hits;
+        final boolean timedOut;
+        final boolean capped;
+        final int scanned;
+        final int total;
+        ScanResult(List<T> hits, boolean timedOut, boolean capped, int scanned, int total) {
+            this.hits = hits;
+            this.timedOut = timedOut;
+            this.capped = capped;
+            this.scanned = scanned;
+            this.total = total;
+        }
+    }
+
+    /**
+     * Run {@code perClass} over every class in parallel, but stop early once either
+     * (a) the wall-clock budget {@code timeoutMs} is exceeded, or (b) {@code cap}
+     * non-null hits have been collected ({@code cap <= 0} disables the cap).
+     *
+     * <p>This is the fix for the "search hangs for minutes and monopolizes the
+     * single bridge worker" class of problem: callers always get a bounded
+     * response. When the scan stops early, {@code timedOut}/{@code capped} say why
+     * and {@code scanned} reports how many of {@code total} classes were examined.
+     *
+     * <p>Note: a parallel stream cannot be hard-cancelled, so after the stop flag
+     * trips the remaining elements still get scheduled — but each becomes a cheap
+     * volatile-read no-op, so wall-time stays bounded.
+     */
+    private <T> ScanResult<T> boundedScan(
+            List<JavaClass> all, long timeoutMs, int cap,
+            java.util.function.Function<JavaClass, T> perClass) {
+        long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+        AtomicBoolean stop = new AtomicBoolean(false);
+        AtomicBoolean timedOut = new AtomicBoolean(false);
+        AtomicBoolean capped = new AtomicBoolean(false);
+        AtomicInteger scanned = new AtomicInteger();
+        ConcurrentLinkedQueue<T> hits = new ConcurrentLinkedQueue<>();
+        all.parallelStream().forEach(c -> {
+            if (stop.get()) return;
+            if (System.nanoTime() > deadline) {
+                timedOut.set(true);
+                stop.set(true);
+                return;
+            }
+            scanned.incrementAndGet();
+            T r;
+            try {
+                r = perClass.apply(c);
+            } catch (Throwable t) {
+                r = null;
+            }
+            if (r != null) {
+                hits.add(r);
+                if (cap > 0 && hits.size() >= cap) {
+                    capped.set(true);
+                    stop.set(true);
+                }
+            }
+        });
+        return new ScanResult<>(new ArrayList<>(hits), timedOut.get(), capped.get(),
+                scanned.get(), all.size());
+    }
+
+    /**
+     * Attach scan progress/termination metadata to a paginated envelope and fix up
+     * {@code has_more}: when a scan stopped early (timeout or hit cap) the true total
+     * is unknown and larger than what we paged, so {@code has_more} must be true even
+     * though {@link Pagination} computed it from the partial result list.
+     */
+    private static void decorateScan(Map<String, Object> out, ScanResult<?> sr, long timeoutMs) {
+        out.put("timed_out", sr.timedOut);
+        out.put("scanned", sr.scanned);
+        out.put("total_classes", sr.total);
+        if (sr.timedOut || sr.capped) {
+            out.put("has_more", true);
+        }
+        if (sr.timedOut) {
+            out.put("note", "Scan hit the " + timeoutMs + "ms budget after examining "
+                    + sr.scanned + "/" + sr.total + " classes; results are partial. "
+                    + "Narrow the query, raise ?timeout_ms=, or page with ?offset=.");
+        }
+    }
+
     /**
      * Find DEX string-pool constants ("foo") used in code. Distinct from
      * {@code /search-classes-by-keyword} (which does case-insensitive substring
@@ -399,17 +558,26 @@ public final class ClassRoutes {
         final boolean fSmali = useSmali;
         final boolean fCode = useCode;
 
+        long timeoutMs = parsePositiveLong(ctx, "timeout_ms", DEFAULT_SEARCH_TIMEOUT_MS);
+        int offset = parsePositive(ctx, "offset", 0);
+        int count = parsePositive(ctx, "count", parsePositive(ctx, "limit", 0));
+        // Early-cap: once we have enough hits to satisfy the requested page we
+        // can stop scanning the remaining (potentially 100k+) classes. count<=0
+        // means "all" -> no cap, and only the deadline bounds the scan.
+        int cap = count > 0 ? offset + count : 0;
+
         try {
             List<JavaClass> all = context.getClassesWithInners();
-            List<Map<String, Object>> matches = all.parallelStream()
-                    .filter(c -> !filterPkg || matchesPackageFilter(c, packageFilter))
-                    .map(c -> findStringUsageInClass(
-                            c, fSmali, smaliNeedle, smaliHaystack,
-                            fCode, codeNeedle, codeHaystack, cs))
-                    .filter(java.util.Objects::nonNull)
-                    .collect(Collectors.toList());
-
-            ctx.json(Pagination.paginate(ctx, matches, "string-usages", "usages", x -> x));
+            ScanResult<Map<String, Object>> sr = boundedScan(all, timeoutMs, cap, c -> {
+                if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
+                return findStringUsageInClass(
+                        c, fSmali, smaliNeedle, smaliHaystack,
+                        fCode, codeNeedle, codeHaystack, cs);
+            });
+            Map<String, Object> out = Pagination.paginate(
+                    sr.hits, "string-usages", "usages", offset, count, x -> x);
+            decorateScan(out, sr, timeoutMs);
+            ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Find string usages failed: " + e.getMessage(), e, logger);
         }

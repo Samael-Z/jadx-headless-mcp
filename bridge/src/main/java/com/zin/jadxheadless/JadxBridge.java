@@ -115,6 +115,27 @@ public class JadxBridge {
             latch.countDown();
         }, "bridge-shutdown"));
 
+        // Orphan guard: if the parent piped our stdin, watch it for EOF. When the
+        // parent process dies (incl. ungraceful kill / Windows, which has no
+        // process-group teardown), the pipe closes and we self-terminate instead
+        // of lingering as an orphan JVM holding -Xmx of RAM.
+        if (cli.exitOnStdinClose) {
+            Thread watchdog = new Thread(() -> {
+                try {
+                    byte[] buf = new byte[256];
+                    while (System.in.read(buf) != -1) {
+                        // drain anything the parent sends; we only care about EOF
+                    }
+                } catch (Throwable ignored) {
+                    // a read error likewise means the pipe (and parent) is gone
+                }
+                System.err.println("[jadx-bridge] stdin closed (parent gone); exiting");
+                System.exit(0);
+            }, "bridge-stdin-watchdog");
+            watchdog.setDaemon(true);
+            watchdog.start();
+        }
+
         // Block forever; SIGTERM from parent triggers the shutdown hook
         try {
             latch.await();
@@ -127,6 +148,17 @@ public class JadxBridge {
         String apkPath;
         String host = "127.0.0.1";
         int port = 0;
+        /**
+         * When set, exit the JVM as soon as stdin reaches EOF. The Rust parent
+         * pipes (and holds open) our stdin; if the parent process dies, the OS
+         * closes the pipe and we observe EOF -> self-terminate. This is the
+         * cross-platform fix for orphaned bridge JVMs: on Windows there are no
+         * process groups, so a killed/exited parent would otherwise leave this
+         * JVM running (and holding ~Xmx of RAM) forever. Off by default so a
+         * manual `java -jar` run (terminal stdin, or stdin from /dev/null) is
+         * unaffected.
+         */
+        boolean exitOnStdinClose = false;
 
         static BridgeArgs parse(String[] argv) {
             BridgeArgs a = new BridgeArgs();
@@ -157,6 +189,9 @@ public class JadxBridge {
                             System.err.println("[jadx-bridge] Invalid --port: " + argv[i]);
                             return null;
                         }
+                        break;
+                    case "--exit-on-stdin-close":
+                        a.exitOnStdinClose = true;
                         break;
                     case "-h":
                     case "--help":
