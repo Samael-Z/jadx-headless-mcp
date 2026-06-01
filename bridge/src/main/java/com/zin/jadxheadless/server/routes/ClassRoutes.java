@@ -567,6 +567,53 @@ public final class ClassRoutes {
         int cap = count > 0 ? offset + count : 0;
 
         try {
+            // ---- Fast path: const-string inverted index (space-for-time) ----
+            // Eligible only for the exact smali query (source=smali, case-sensitive),
+            // which the index reproduces precisely AND with an accurate total. Any other
+            // mode (code/both, substring, case-insensitive) or a not-yet-ready index
+            // falls through to the bounded live scan below.
+            boolean indexEligible = fSmali && !fCode && cs;
+            if (indexEligible) {
+                List<String> fqns = context.stringIndex().lookup(literal, packageFilter);
+                if (fqns != null) { // index is READY
+                    int total = fqns.size();
+                    int from = Math.min(Math.max(offset, 0), total);
+                    int to = count <= 0 ? total : Math.min(from + count, total);
+                    List<Map<String, Object>> usages = new ArrayList<>(Math.max(0, to - from));
+                    for (int i = from; i < to; i++) {
+                        String fqn = fqns.get(i);
+                        Map<String, Object> row = new HashMap<>();
+                        row.put("class_name", fqn);
+                        row.put("matched_in", "smali");
+                        // Snippet/line: only the page's (few) classes need their smali fetched.
+                        JavaClass c = context.findClassByFqn(fqn);
+                        String smali = c != null ? safeSmali(c) : null;
+                        if (smali != null) {
+                            Map<String, Object> hit = scanForLiteral(smali, smaliHaystack, cs);
+                            if (hit != null) {
+                                row.put("line", hit.get("line"));
+                                row.put("hits", hit.get("hits"));
+                                row.put("snippet", hit.get("snippet"));
+                            }
+                        }
+                        usages.add(row);
+                    }
+                    Map<String, Object> out = new HashMap<>();
+                    out.put("type", "string-usages");
+                    out.put("offset", from);
+                    out.put("count", usages.size());
+                    out.put("page_size", Math.max(count, 0));
+                    out.put("total", total);
+                    out.put("returned", usages.size());
+                    out.put("has_more", to < total);
+                    out.put("usages", usages);
+                    out.put("index", "ready");
+                    ctx.json(out);
+                    return;
+                }
+            }
+
+            // ---- Live bounded scan (index absent/building, or non-exact query) ----
             List<JavaClass> all = context.getClassesWithInners();
             ScanResult<Map<String, Object>> sr = boundedScan(all, timeoutMs, cap, c -> {
                 if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
@@ -577,6 +624,7 @@ public final class ClassRoutes {
             Map<String, Object> out = Pagination.paginate(
                     sr.hits, "string-usages", "usages", offset, count, x -> x);
             decorateScan(out, sr, timeoutMs);
+            out.put("index", context.stringIndex().status().name().toLowerCase());
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Find string usages failed: " + e.getMessage(), e, logger);
@@ -664,6 +712,11 @@ public final class ClassRoutes {
 
     public void handleCacheStats(Context ctx) {
         ctx.json(context.cache().stats());
+    }
+
+    /** Const-string inverted index build/load status (absent|building|ready|failed) + progress. */
+    public void handleIndexStatus(Context ctx) {
+        ctx.json(context.stringIndex().statusMap());
     }
 
     public void handleCacheClear(Context ctx) {

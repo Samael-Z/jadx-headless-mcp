@@ -75,6 +75,7 @@ public final class BridgeServer {
         app.get("/find-string-usages", cls::handleFindStringUsages);
         app.get("/package-tree", cls::handlePackageTree);
         app.get("/cache-stats", cls::handleCacheStats);
+        app.get("/index-status", cls::handleIndexStatus);
         app.post("/cache-clear", cls::handleCacheClear);
 
         // Methods

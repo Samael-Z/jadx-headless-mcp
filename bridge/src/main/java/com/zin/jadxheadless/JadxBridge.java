@@ -101,6 +101,11 @@ public class JadxBridge {
         out.flush();
         System.err.println("[jadx-bridge] Listening on http://" + cli.host + ":" + actualPort);
 
+        // Space-for-time: build (or load from disk) the const-string inverted index in
+        // the background so find-string-usages becomes O(1) instead of re-scanning every
+        // class. Non-blocking -- searches fall back to the bounded live scan until READY.
+        context.startStringIndexBuild();
+
         CountDownLatch latch = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.err.println("[jadx-bridge] Shutting down");

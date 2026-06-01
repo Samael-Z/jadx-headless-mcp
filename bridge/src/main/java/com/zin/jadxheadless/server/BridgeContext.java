@@ -1,10 +1,14 @@
 package com.zin.jadxheadless.server;
 
 import com.zin.jadxheadless.util.DecompilationCache;
+import com.zin.jadxheadless.util.StringIndex;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,9 +29,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public final class BridgeContext {
 
+    private static final Logger logger = LoggerFactory.getLogger(BridgeContext.class);
+
     private final JadxDecompiler jadx;
     private final File apkFile;
     private final DecompilationCache cache = new DecompilationCache();
+    private final StringIndex stringIndex = new StringIndex();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
     /** Cached, lazily computed snapshot of all classes including inner classes. */
@@ -61,8 +68,75 @@ public final class BridgeContext {
         return cache;
     }
 
+    public StringIndex stringIndex() {
+        return stringIndex;
+    }
+
     public ReadWriteLock lock() {
         return lock;
+    }
+
+    /**
+     * Kick off the const-string inverted index build in the background (space-for-time).
+     * Tries to load a persisted index next to the APK first; only rebuilds (and re-persists)
+     * when absent/stale. Non-blocking: until the index is READY, find-string-usages falls
+     * back to the bounded live scan. Safe to call once after the server is listening.
+     */
+    public void startStringIndexBuild() {
+        Thread t = new Thread(() -> {
+            try {
+                Path idxFile = stringIndexFile();
+                if (idxFile != null && stringIndex.load(idxFile)) {
+                    return; // reused persisted index
+                }
+                logger.info("[string-index] building (no valid cache at {})", idxFile);
+                stringIndex.build(getClassesWithInners(), BridgeContext::safeSmali);
+                if (idxFile != null && stringIndex.status() == StringIndex.Status.READY) {
+                    try {
+                        stringIndex.save(idxFile);
+                        logger.info("[string-index] persisted to {}", idxFile);
+                    } catch (Exception e) {
+                        logger.warn("[string-index] persist failed (in-memory index still active): {}", e.toString());
+                    }
+                }
+            } catch (Throwable t2) {
+                logger.warn("[string-index] background build error: {}", t2.toString());
+            }
+        }, "string-index-builder");
+        t.setDaemon(true);
+        // Slightly below normal so live request handling stays responsive during the build.
+        try { t.setPriority(Thread.NORM_PRIORITY - 1); } catch (Throwable ignored) {}
+        t.start();
+    }
+
+    /**
+     * Persisted-index location: {@code <apk-dir>/.jadx-mcp-cache/<apk-name>.<size>.stridx}.
+     * Keyed by APK name + byte size so a changed/replaced APK rebuilds automatically.
+     * Falls back to the temp dir if the APK's directory is not writable.
+     */
+    private Path stringIndexFile() {
+        try {
+            File parent = apkFile.getAbsoluteFile().getParentFile();
+            File dir;
+            if (parent != null && parent.canWrite()) {
+                dir = new File(parent, ".jadx-mcp-cache");
+            } else {
+                dir = new File(System.getProperty("java.io.tmpdir"), "jadx-mcp-cache");
+            }
+            String name = apkFile.getName() + "." + apkFile.length() + ".stridx";
+            return new File(dir, name).toPath();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Wrap {@code getSmali()} -- never throw during the index build. */
+    static String safeSmali(JavaClass c) {
+        try {
+            return c.getSmali();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** All classes including inner classes. Cached after first call. */
