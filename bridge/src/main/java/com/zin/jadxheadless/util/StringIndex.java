@@ -55,7 +55,7 @@ public final class StringIndex {
 
     /** Bump when the on-disk format changes so stale files are ignored. */
     private static final int MAGIC = 0x4A584D31; // "JXM1"
-    private static final int FORMAT_VERSION = 2; // v2 adds the method-name index
+    private static final int FORMAT_VERSION = 3; // v3 adds field-name + type-hierarchy indexes
 
     public enum Status { ABSENT, BUILDING, READY, FAILED }
 
@@ -69,6 +69,10 @@ public final class StringIndex {
     private volatile Map<String, int[]> postings;
     /** method name -> sorted class ids (classes declaring a method with that exact name). */
     private volatile Map<String, int[]> methodPostings;
+    /** field name -> sorted class ids (classes declaring a field with that exact name). */
+    private volatile Map<String, int[]> fieldPostings;
+    /** supertype/interface FQN -> sorted class ids of its DIRECT subclasses/implementors. */
+    private volatile Map<String, int[]> typeHierarchy;
     private volatile String[] idToFqn;
 
     public Status status() { return status; }
@@ -80,6 +84,8 @@ public final class StringIndex {
         m.put("total_classes", totalClasses);
         m.put("distinct_strings", postings == null ? 0 : postings.size());
         m.put("distinct_methods", methodPostings == null ? 0 : methodPostings.size());
+        m.put("distinct_fields", fieldPostings == null ? 0 : fieldPostings.size());
+        m.put("distinct_supertypes", typeHierarchy == null ? 0 : typeHierarchy.size());
         m.put("build_ms", buildMillis);
         if (!detail.isEmpty()) m.put("detail", detail);
         return m;
@@ -126,6 +132,8 @@ public final class StringIndex {
             // that ~6x saving is the difference between fitting in heap and OOM.
             final ConcurrentHashMap<String, IntBag> tmp = new ConcurrentHashMap<>(1 << 20);
             final ConcurrentHashMap<String, IntBag> tmpM = new ConcurrentHashMap<>(1 << 19);
+            final ConcurrentHashMap<String, IntBag> tmpF = new ConcurrentHashMap<>(1 << 19);
+            final ConcurrentHashMap<String, IntBag> tmpH = new ConcurrentHashMap<>(1 << 16);
             IntStream.range(0, classes.size()).parallel().forEach(i -> {
                 try {
                     JavaClass c = classes.get(i);
@@ -137,6 +145,10 @@ public final class StringIndex {
                                 tmp.computeIfAbsent(val, k -> new IntBag()).add(id));
                         extractMethodNames(smali, name ->
                                 tmpM.computeIfAbsent(name, k -> new IntBag()).add(id));
+                        extractFieldNames(smali, name ->
+                                tmpF.computeIfAbsent(name, k -> new IntBag()).add(id));
+                        extractSuperTypes(smali, sup ->
+                                tmpH.computeIfAbsent(sup, k -> new IntBag()).add(id));
                     }
                 } catch (Throwable t) {
                     // One bad/huge class must not fail the whole build.
@@ -149,13 +161,17 @@ public final class StringIndex {
             });
             Map<String, int[]> frozen = freeze(tmp);
             Map<String, int[]> frozenM = freeze(tmpM);
+            Map<String, int[]> frozenF = freeze(tmpF);
+            Map<String, int[]> frozenH = freeze(tmpH);
             this.idToFqn = fqns;
             this.postings = frozen;
             this.methodPostings = frozenM;
+            this.fieldPostings = frozenF;
+            this.typeHierarchy = frozenH;
             this.buildMillis = System.currentTimeMillis() - t0;
             status = Status.READY;
-            logger.info("[string-index] READY: {} strings / {} method-names over {} classes in {}ms",
-                    frozen.size(), frozenM.size(), classes.size(), buildMillis);
+            logger.info("[string-index] READY: {} strings / {} methods / {} fields / {} supertypes over {} classes in {}ms",
+                    frozen.size(), frozenM.size(), frozenF.size(), frozenH.size(), classes.size(), buildMillis);
         } catch (Throwable t) {
             detail = String.valueOf(t);
             status = Status.FAILED;
@@ -309,6 +325,44 @@ public final class StringIndex {
     }
 
     /**
+     * Classes declaring a FIELD whose name contains {@code term} (case-insensitive), up to {@code cap}
+     * distinct classes. Mirror of {@link #lookupMethodContains}. Returns null if the index is not READY.
+     */
+    public List<String> lookupFieldContains(String term, String packageFilter, int cap, int[] outScannedKeys) {
+        Map<String, int[]> fp = fieldPostings;
+        String[] f = idToFqn;
+        if (status != Status.READY || fp == null || f == null) return null;
+        String t = term.toLowerCase();
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        int keys = 0;
+        for (Map.Entry<String, int[]> e : fp.entrySet()) {
+            keys++;
+            if (!e.getKey().toLowerCase().contains(t)) continue;
+            for (int id : e.getValue()) {
+                if (id < 0 || id >= f.length) continue;
+                String fqn = f[id];
+                if (!filt || fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter)) {
+                    out.add(fqn);
+                    if (cap > 0 && out.size() >= cap) { if (outScannedKeys != null) outScannedKeys[0] = keys; return new ArrayList<>(out); }
+                }
+            }
+        }
+        if (outScannedKeys != null) outScannedKeys[0] = keys;
+        return new ArrayList<>(out);
+    }
+
+    /**
+     * Direct subclasses / interface implementors of {@code supertypeFqn} (exact FQN). {@code null} if
+     * the index is not READY; an empty list means ready but nothing declares it as super/interface.
+     */
+    public List<String> lookupSubtypes(String supertypeFqn, String packageFilter) {
+        Map<String, int[]> th = typeHierarchy;
+        if (status != Status.READY || th == null || idToFqn == null) return null;
+        return idsToFqns(th.get(supertypeFqn), packageFilter);
+    }
+
+    /**
      * Extract every method name declared in a class's smali ({@code .method <mods> name(...)...}),
      * including {@code <init>}/{@code <clinit>}. Hand-written scan (no regex), one line per method.
      */
@@ -329,6 +383,61 @@ public final class StringIndex {
             }
             from = lineEnd + 1;
         }
+    }
+
+    /**
+     * Extract every field name declared in a class's smali ({@code .field <mods> name:type}).
+     * Hand-written scan, one line per field.
+     */
+    private static void extractFieldNames(String smali, java.util.function.Consumer<String> sink) {
+        int from = 0;
+        int len = smali.length();
+        while (true) {
+            int idx = smali.indexOf(".field", from);
+            if (idx < 0) break;
+            int lineEnd = smali.indexOf('\n', idx);
+            if (lineEnd < 0) lineEnd = len;
+            int colon = smali.indexOf(':', idx);
+            if (colon > 0 && colon < lineEnd) {
+                int s = colon - 1;
+                while (s > idx && smali.charAt(s) != ' ' && smali.charAt(s) != '\t') s--;
+                String name = smali.substring(s + 1, colon);
+                if (!name.isEmpty()) sink.accept(name);
+            }
+            from = lineEnd + 1;
+        }
+    }
+
+    /**
+     * Extract a class's direct super class ({@code .super L...;}) and interfaces
+     * ({@code .implements L...;}) as dotted FQNs.
+     */
+    private static void extractSuperTypes(String smali, java.util.function.Consumer<String> sink) {
+        int len = smali.length();
+        int sup = smali.indexOf(".super ");
+        if (sup >= 0) {
+            String t = smaliRefType(smali, sup, len);
+            if (t != null) sink.accept(t);
+        }
+        int from = 0;
+        while (true) {
+            int idx = smali.indexOf(".implements ", from);
+            if (idx < 0) break;
+            int lineEnd = smali.indexOf('\n', idx);
+            if (lineEnd < 0) lineEnd = len;
+            String t = smaliRefType(smali, idx, lineEnd);
+            if (t != null) sink.accept(t);
+            from = lineEnd + 1;
+        }
+    }
+
+    /** Parse the {@code L<pkg>/<Name>;} token after {@code .super}/{@code .implements} into a dotted FQN. */
+    private static String smaliRefType(String smali, int from, int limit) {
+        int l = smali.indexOf('L', from);
+        if (l < 0 || l >= limit) return null;
+        int semi = smali.indexOf(';', l);
+        if (semi < 0 || semi >= limit) return null;
+        return smali.substring(l + 1, semi).replace('/', '.');
     }
 
     /**
@@ -382,8 +491,10 @@ public final class StringIndex {
     public void save(Path file) throws IOException {
         Map<String, int[]> p = postings;
         Map<String, int[]> pm = methodPostings;
+        Map<String, int[]> pf = fieldPostings;
+        Map<String, int[]> ph = typeHierarchy;
         String[] f = idToFqn;
-        if (p == null || pm == null || f == null) throw new IOException("index not built");
+        if (p == null || pm == null || pf == null || ph == null || f == null) throw new IOException("index not built");
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
         Files.createDirectories(file.getParent());
         try (OutputStream fos = Files.newOutputStream(tmp);
@@ -396,6 +507,8 @@ public final class StringIndex {
             for (String fqn : f) writeStr(out, fqn == null ? "" : fqn);
             writePostings(out, p);
             writePostings(out, pm);
+            writePostings(out, pf);
+            writePostings(out, ph);
         }
         Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
@@ -438,14 +551,18 @@ public final class StringIndex {
             for (int i = 0; i < n; i++) f[i] = readStr(in);
             Map<String, int[]> p = readPostings(in, n);
             Map<String, int[]> pm = readPostings(in, n);
+            Map<String, int[]> pf = readPostings(in, n);
+            Map<String, int[]> ph = readPostings(in, n);
             this.idToFqn = f;
             this.postings = p;
             this.methodPostings = pm;
+            this.fieldPostings = pf;
+            this.typeHierarchy = ph;
             this.totalClasses = n;
             this.builtClasses.set(n);
             this.status = Status.READY;
-            logger.info("[string-index] loaded {} strings / {} method-names / {} classes from {}",
-                    p.size(), pm.size(), n, file.getFileName());
+            logger.info("[string-index] loaded {} strings / {} methods / {} fields / {} supertypes / {} classes from {}",
+                    p.size(), pm.size(), pf.size(), ph.size(), n, file.getFileName());
             return true;
         } catch (Throwable t) {
             logger.warn("[string-index] load failed ({}), will rebuild", t.toString());

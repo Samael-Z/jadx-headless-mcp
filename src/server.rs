@@ -433,6 +433,23 @@ impl JadxMcpServer {
         Ok(self.get("/search-string-constants", &q).await)
     }
 
+    #[tool(description = "List the DIRECT subclasses / interface implementors of a class or interface, from \
+                          the type-hierarchy index (built from smali .super/.implements in the same pass). \
+                          Answers 'who extends BaseActivity' / 'who implements Callback'. `class_name` is the \
+                          FQN as shown in decompiled source (for SDK/framework base classes that's the DEX \
+                          name). Index-backed (poll index_status); paginated.")]
+    async fn get_subclasses(
+        &self,
+        Parameters(req): Parameters<SubclassesReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![("class_name", req.class_name)];
+        if let Some(p) = req.package {
+            q.push(("package", p));
+        }
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/subclasses", &q).await)
+    }
+
     #[tool(description = "Decompilation source cache statistics: hits, misses, hit_rate, cached_classes, compressed_mb.")]
     async fn get_cache_stats(&self) -> Result<CallToolResult, McpError> {
         Ok(self.get("/cache-stats", &[]).await)

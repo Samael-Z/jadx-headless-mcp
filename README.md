@@ -150,12 +150,12 @@ The 2 GB default is a **baseline**: passing your own `-Xmx` overrides the heap, 
 
 ## Tools exposed
 
-Thirty-two tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
+Thirty-three tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
 
 | Category | Tool |
 |---|---|
 | **Session** | `load_apk`, `current_apk` |
-| **Classes** | `get_all_classes`, `get_class_source`, `get_class_sources` (batch), `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword` (substring or `regex=true`), `search_string_constants`, `get_cache_stats`, `clear_cache`, `index_status` |
+| **Classes** | `get_all_classes`, `get_class_source`, `get_class_sources` (batch), `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword` (substring or `regex=true`), `search_string_constants`, `get_cache_stats`, `clear_cache`, `index_status`, `get_subclasses` |
 | **Methods** | `get_method_by_name`, `search_method_by_name` |
 | **Resources** | `get_android_manifest`, `get_strings`, `get_all_resource_file_names`, `get_resource_file` |
 | **Xrefs** | `get_xrefs_to_class`, `get_xrefs_to_method`, `get_xrefs_to_field`, `get_xrefs_from_method`, `get_xrefs_from_class` |

@@ -238,3 +238,16 @@ pub struct XrefsFromClassReq {
     #[serde(default)]
     pub count: Option<u32>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SubclassesReq {
+    /// Fully-qualified class or interface name. Returns its DIRECT subclasses / implementors.
+    pub class_name: String,
+    /// Optional package prefix filter on the results.
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}

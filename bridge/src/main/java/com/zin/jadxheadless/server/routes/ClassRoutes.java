@@ -410,6 +410,22 @@ public final class ClassRoutes {
             int scanned = 0;
 
             for (SearchLocation loc : locations) {
+                // METHOD/FIELD name: use the inverted index when eligible (plain case-insensitive
+                // substring, no regex) -- built from the same smali pass, so it skips the per-class
+                // getMethods()/getFields() live scan. Falls through to live scan if not READY.
+                if (!regex && !caseSensitive
+                        && (loc == SearchLocation.METHOD_NAME || loc == SearchLocation.FIELD_NAME)) {
+                    List<String> idxHit = (loc == SearchLocation.METHOD_NAME)
+                            ? context.stringIndex().lookupMethodContains(term, packageFilter, 0, null)
+                            : context.stringIndex().lookupFieldContains(term, packageFilter, 0, null);
+                    if (idxHit != null) {
+                        for (String fqn : idxHit) {
+                            JavaClass c = context.findClassByFqn(fqn);
+                            if (c != null) matched.add(c);
+                        }
+                        continue;
+                    }
+                }
                 // CLASS/METHOD/FIELD name matching is cheap string work (no decompile)
                 // -- the existing fast path returns in well under a second. CODE/COMMENT
                 // decompile every class, so they go through the time-bounded scan.
@@ -896,6 +912,39 @@ public final class ClassRoutes {
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Search string constants failed: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /**
+     * Direct subclasses / interface implementors of a class, from the type-hierarchy index.
+     * {@code class_name} is matched against the smali super/interface ref (the original DEX FQN —
+     * for SDK/framework base classes and un-obfuscated classes that equals the decompiled FQN).
+     * Index-backed; requires the index to be {@code ready}.
+     */
+    public void handleSubclasses(Context ctx) {
+        String className = requireClassName(ctx);
+        if (className == null) return;
+        try {
+            String packageFilter = ctx.queryParam("package");
+            List<String> subs = context.stringIndex().lookupSubtypes(className,
+                    isValidPackageFilter(packageFilter) ? packageFilter : null);
+            if (subs == null) {
+                String st = context.stringIndex().status().name().toLowerCase();
+                Map<String, Object> out = new HashMap<>();
+                out.put("type", "subclasses");
+                out.put("class", className);
+                out.put("index", st);
+                out.put("subclasses", new ArrayList<>());
+                out.put("note", "Type-hierarchy index not ready (" + st + "). Retry shortly (poll index_status).");
+                ctx.json(out);
+                return;
+            }
+            Map<String, Object> out = Pagination.paginate(ctx, subs, "subclasses", "subclasses", x -> x);
+            out.put("class", className);
+            out.put("index", "ready");
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Subclasses lookup failed: " + e.getMessage(), e, logger);
         }
     }
 
