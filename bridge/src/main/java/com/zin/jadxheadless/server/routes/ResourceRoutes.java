@@ -3,6 +3,7 @@ package com.zin.jadxheadless.server.routes;
 import com.zin.jadxheadless.server.BridgeContext;
 import com.zin.jadxheadless.util.Errors;
 import com.zin.jadxheadless.util.Pagination;
+import com.zin.jadxheadless.util.TextUtil;
 import io.javalin.http.Context;
 import jadx.api.ResourceFile;
 import jadx.core.utils.android.AndroidManifestParser;
@@ -33,10 +34,16 @@ public final class ResourceRoutes {
                 return;
             }
             String content = manifest.loadContent().getText().getCodeStr();
-            ctx.json(Map.of(
-                    "name", manifest.getOriginalName(),
-                    "type", "manifest/xml",
-                    "content", content));
+            int max = TextUtil.maxChars(ctx);
+            Map<String, Object> out = new HashMap<>();
+            out.put("name", manifest.getOriginalName());
+            out.put("type", "manifest/xml");
+            out.put("content", TextUtil.cap(content, max));
+            if (max > 0 && content != null && content.length() > max) {
+                out.put("truncated", true);
+                out.put("total_chars", content.length());
+            }
+            ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to read manifest: " + e.getMessage(), e, logger);
         }
@@ -124,22 +131,17 @@ public final class ResourceRoutes {
             Errors.send(ctx, 400, "Missing required parameter 'resource_name'", logger);
             return;
         }
+        int max = TextUtil.maxChars(ctx);
         try {
             for (ResourceFile resFile : context.jadx().getResources()) {
                 if (name.equals(resFile.getDeobfName())) {
-                    Map<String, String> file = new HashMap<>();
-                    file.put("file_name", resFile.getDeobfName());
-                    file.put("content", resFile.loadContent().getText().getCodeStr());
-                    ctx.json(Map.of("type", "resource/text", "file", file));
+                    respondResource(ctx, name, resFile.loadContent(), max);
                     return;
                 }
                 if ("resources.arsc".equals(resFile.getDeobfName())) {
                     for (ResContainer sub : resFile.loadContent().getSubFiles()) {
                         if (name.equals(sub.getFileName())) {
-                            Map<String, String> file = new HashMap<>();
-                            file.put("file_name", sub.getFileName());
-                            file.put("content", sub.getText().getCodeStr());
-                            ctx.json(Map.of("type", "resource/text", "file", file));
+                            respondResource(ctx, name, sub, max);
                             return;
                         }
                     }
@@ -149,5 +151,40 @@ public final class ResourceRoutes {
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to fetch resource: " + e.getMessage(), e, logger);
         }
+    }
+
+    /**
+     * Emit a resource as text, capped. Non-text/binary resources (e.g. {@code .properties}
+     * loaded as raw data, fonts, images) make jadx's {@code getText()} throw — previously a
+     * 500 ClassCastException. We now catch that and return a graceful binary marker instead.
+     */
+    private void respondResource(Context ctx, String name, ResContainer rc, int max) {
+        String text = safeText(rc);
+        Map<String, Object> file = new HashMap<>();
+        file.put("file_name", name);
+        if (text != null) {
+            file.put("content", TextUtil.cap(text, max));
+            if (max > 0 && text.length() > max) {
+                file.put("truncated", true);
+                file.put("total_chars", text.length());
+            }
+            ctx.json(Map.of("type", "resource/text", "file", file));
+        } else {
+            file.put("content", "");
+            file.put("note", "Binary or non-text resource; cannot render as text.");
+            ctx.json(Map.of("type", "resource/binary", "file", file));
+        }
+    }
+
+    /** Extract a resource's text, or null if it is binary/non-text (jadx getText() throws). */
+    private static String safeText(ResContainer rc) {
+        try {
+            if (rc != null && rc.getText() != null) {
+                return rc.getText().getCodeStr();
+            }
+        } catch (Throwable t) {
+            // binary / decoded-data / unsupported resource type
+        }
+        return null;
     }
 }

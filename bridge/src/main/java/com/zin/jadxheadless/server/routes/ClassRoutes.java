@@ -3,6 +3,7 @@ package com.zin.jadxheadless.server.routes;
 import com.zin.jadxheadless.server.BridgeContext;
 import com.zin.jadxheadless.util.Errors;
 import com.zin.jadxheadless.util.Pagination;
+import com.zin.jadxheadless.util.TextUtil;
 import io.javalin.http.Context;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
@@ -104,7 +105,7 @@ public final class ClassRoutes {
                 Errors.send(ctx, 404, "Class not found: " + className, logger);
                 return;
             }
-            ctx.result(decompiledCode(cls));
+            ctx.result(TextUtil.cap(decompiledCode(cls), TextUtil.maxChars(ctx)));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to decompile class: " + e.getMessage(), e, logger);
         }
@@ -177,7 +178,7 @@ public final class ClassRoutes {
                 Errors.send(ctx, 404, "Class not found: " + className, logger);
                 return;
             }
-            ctx.result(cls.getSmali());
+            ctx.result(TextUtil.cap(cls.getSmali(), TextUtil.maxChars(ctx)));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to get smali: " + e.getMessage(), e, logger);
         }
@@ -221,7 +222,7 @@ public final class ClassRoutes {
             ctx.json(Map.of(
                     "name", main.getFullName(),
                     "type", "code/java",
-                    "content", code));
+                    "content", TextUtil.cap(code, TextUtil.maxChars(ctx))));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to resolve main activity: " + e.getMessage(), e, logger);
         }
@@ -238,7 +239,14 @@ public final class ClassRoutes {
                     .filter(c -> c.getFullName().startsWith(pkg + ".") || c.getFullName().equals(pkg))
                     .map(JavaClass::getFullName)
                     .collect(Collectors.toList());
-            ctx.json(Map.of("package", pkg, "count", names.size(), "classes", names));
+            // Paginate with a SANE DEFAULT page (not "all"): a real app has 80k+ such classes;
+            // the un-paginated list was a 6MB+ response that overflowed MCP clients. The generic
+            // paginate default is count=0=all, so set an explicit default here. ?count=0 for all.
+            int offset = parsePositive(ctx, "offset", 0);
+            int count = parsePositive(ctx, "count", 500);
+            Map<String, Object> out = Pagination.paginate(names, "application-class-names", "classes", offset, count, x -> x);
+            out.put("package", pkg);
+            ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to list main app classes: " + e.getMessage(), e, logger);
         }

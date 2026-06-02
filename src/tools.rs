@@ -16,6 +16,10 @@ pub struct LoadApkReq {
 pub struct ClassNameReq {
     /// Fully qualified class name, e.g. "com.example.MainActivity".
     pub class_name: String,
+    /// Max characters of source/smali to return (default 120000; 0 = unlimited). Huge classes
+    /// are truncated with a marker so a single class can't overflow the client; raise to fetch more.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -110,6 +114,9 @@ pub struct FindStringUsagesReq {
 pub struct ResourceFileReq {
     /// Resource path inside the APK, e.g. "res/xml/network_security_config.xml".
     pub resource_name: String,
+    /// Max characters to return (default 120000; 0 = unlimited). Large resources are truncated.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

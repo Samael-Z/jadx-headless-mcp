@@ -229,7 +229,10 @@ impl JadxMcpServer {
         &self,
         Parameters(req): Parameters<ClassNameReq>,
     ) -> Result<CallToolResult, McpError> {
-        let q = vec![("class_name", req.class_name)];
+        let mut q = vec![("class_name", req.class_name)];
+        if let Some(m) = req.max_chars {
+            q.push(("max_chars", m.to_string()));
+        }
         Ok(self.get("/class-source", &q).await)
     }
 
@@ -256,7 +259,10 @@ impl JadxMcpServer {
         &self,
         Parameters(req): Parameters<ClassNameReq>,
     ) -> Result<CallToolResult, McpError> {
-        let q = vec![("class_name", req.class_name)];
+        let mut q = vec![("class_name", req.class_name)];
+        if let Some(m) = req.max_chars {
+            q.push(("max_chars", m.to_string()));
+        }
         Ok(self.get("/smali-of-class", &q).await)
     }
 
@@ -266,9 +272,13 @@ impl JadxMcpServer {
     }
 
     #[tool(description = "List class names belonging to the application's main package (manifest `package` attribute). \
-                          Useful for filtering out third-party libraries.")]
-    async fn get_main_application_classes_names(&self) -> Result<CallToolResult, McpError> {
-        Ok(self.get("/main-application-classes-names", &[]).await)
+                          Useful for filtering out third-party libraries. Paginated (default count=500; \
+                          count=0 = all) — a large app has 80k+ such classes.")]
+    async fn get_main_application_classes_names(
+        &self,
+        Parameters(req): Parameters<PaginationReq>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(self.get("/main-application-classes-names", &pagination_qs(&req.offset, &req.count)).await)
     }
 
     #[tool(description = "Fetch decompiled source for every class in the application's main package. Paginated; \
@@ -414,7 +424,10 @@ impl JadxMcpServer {
         &self,
         Parameters(req): Parameters<ResourceFileReq>,
     ) -> Result<CallToolResult, McpError> {
-        let q = vec![("resource_name", req.resource_name)];
+        let mut q = vec![("resource_name", req.resource_name)];
+        if let Some(m) = req.max_chars {
+            q.push(("max_chars", m.to_string()));
+        }
         Ok(self.get("/get-resource-file", &q).await)
     }
 
