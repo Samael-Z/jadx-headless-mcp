@@ -65,6 +65,7 @@ public final class BridgeServer {
         // Classes
         app.get("/all-classes", cls::handleAllClasses);
         app.get("/class-source", cls::handleClassSource);
+        app.get("/class-sources", cls::handleClassSources);
         app.get("/methods-of-class", cls::handleMethodsOfClass);
         app.get("/fields-of-class", cls::handleFieldsOfClass);
         app.get("/smali-of-class", cls::handleSmaliOfClass);
@@ -73,6 +74,7 @@ public final class BridgeServer {
         app.get("/main-application-classes-code", cls::handleMainApplicationClassesCode);
         app.get("/search-classes-by-keyword", cls::handleSearchClassesByKeyword);
         app.get("/find-string-usages", cls::handleFindStringUsages);
+        app.get("/search-string-constants", cls::handleSearchStringConstants);
         app.get("/package-tree", cls::handlePackageTree);
         app.get("/cache-stats", cls::handleCacheStats);
         app.get("/index-status", cls::handleIndexStatus);
@@ -92,6 +94,8 @@ public final class BridgeServer {
         app.get("/xrefs-to-class", xr::handleXrefsToClass);
         app.get("/xrefs-to-method", xr::handleXrefsToMethod);
         app.get("/xrefs-to-field", xr::handleXrefsToField);
+        app.get("/xrefs-from-method", xr::handleXrefsFromMethod);
+        app.get("/xrefs-from-class", xr::handleXrefsFromClass);
 
         // Refactoring (renames). State is in-memory only — no .jobf persistence yet.
         app.get("/rename-class", rf::handleRenameClass);

@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -231,6 +232,67 @@ public final class StringIndex {
         }
         if (outScannedKeys != null) outScannedKeys[0] = keys;
         return new ArrayList<>(out);
+    }
+
+    /** Per-value cap on how many owning classes are inlined into a {@link #searchKeys} hit. */
+    private static final int MAX_CLASSES_PER_VALUE = 100;
+
+    /**
+     * Discovery search over the const-string KEY SET: find string CONSTANTS whose value matches
+     * {@code query} by substring (default) or regex, and list the classes that declare each.
+     *
+     * <p>Distinct from {@link #lookup(String, String)} (exact value -&gt; classes). This is
+     * "show me every embedded string containing 'http' / matching '[A-Za-z0-9+/]{32,}' and where
+     * it lives" — the bread-and-butter of locating URLs, keys, and crypto material. O(distinct
+     * strings), sub-second even at ~776k keys, because the heavy smali pass already ran at build
+     * time. Returns {@code null} when the index is not READY (caller falls back / reports building).
+     *
+     * @param cap max distinct matching values to return (&lt;=0 = no cap)
+     */
+    public List<Map<String, Object>> searchKeys(String query, boolean caseSensitive, boolean regex,
+                                                String packageFilter, int cap) {
+        Map<String, int[]> p = postings;
+        String[] f = idToFqn;
+        if (status != Status.READY || p == null || f == null) return null;
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        java.util.regex.Pattern pat = null;
+        String needle = null;
+        if (regex) {
+            pat = java.util.regex.Pattern.compile(query,
+                    caseSensitive ? 0 : java.util.regex.Pattern.CASE_INSENSITIVE);
+        } else {
+            needle = caseSensitive ? query : query.toLowerCase();
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map.Entry<String, int[]> e : p.entrySet()) {
+            String key = e.getKey();
+            boolean match;
+            if (pat != null) {
+                match = pat.matcher(key).find();
+            } else {
+                String hay = caseSensitive ? key : key.toLowerCase();
+                match = hay.contains(needle);
+            }
+            if (!match) continue;
+            List<String> classes = new ArrayList<>();
+            int matchedCount = 0;
+            for (int id : e.getValue()) {
+                if (id < 0 || id >= f.length) continue;
+                String fqn = f[id];
+                if (filt && !(fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter))) continue;
+                matchedCount++;
+                if (classes.size() < MAX_CLASSES_PER_VALUE) classes.add(fqn);
+            }
+            if (matchedCount == 0) continue; // package filter removed every owner
+            Map<String, Object> row = new HashMap<>();
+            row.put("value", key);
+            row.put("class_count", matchedCount);
+            row.put("classes", classes);
+            if (matchedCount > classes.size()) row.put("classes_truncated", true);
+            out.add(row);
+            if (cap > 0 && out.size() >= cap) break;
+        }
+        return out;
     }
 
     private List<String> idsToFqns(int[] ids, String packageFilter) {

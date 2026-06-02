@@ -189,6 +189,163 @@ public final class XrefsRoutes {
         }
     }
 
+    /**
+     * Outgoing calls (callees) of a single method — the complement of {@link #handleXrefsToMethod}.
+     * jadx exposes incoming refs ({@code getUseIn}) but no ready callee list, so we parse the
+     * method's smali {@code invoke-*} opcodes. That works even on R8/anti-tamper hardened classes
+     * whose Java decompile is empty (same rationale as the const-string index). With no
+     * {@code descriptor}, the callees of every overload of {@code method_name} are merged.
+     */
+    public void handleXrefsFromMethod(Context ctx) {
+        String className = require(ctx, "class_name");
+        String methodName = require(ctx, "method_name");
+        if (className == null || methodName == null) return;
+        String descriptor = ctx.queryParam("descriptor");
+        try {
+            JavaClass cls = find(className);
+            if (cls == null) {
+                Errors.send(ctx, 404, "Class not found: " + className, logger);
+                return;
+            }
+            String smali = safeSmali(cls);
+            if (smali == null || smali.isEmpty()) {
+                Errors.send(ctx, 404, "No smali available for " + cls.getFullName(), logger);
+                return;
+            }
+            List<Map<String, Object>> callees = calleesOfMethod(smali, methodName, descriptor);
+            Map<String, Object> out = Pagination.paginate(ctx, callees, "xrefs-from", "callees", r -> r);
+            out.put("class", cls.getFullName());
+            out.put("method", methodName);
+            if (callees.isEmpty()) {
+                out.put("note", "No invoke targets parsed — check the method name (pass ?descriptor= for a "
+                        + "specific overload, in smali form e.g. (Ljava/lang/String;)V), or the method makes no calls.");
+            }
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Failed to find outgoing calls: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /** Outgoing calls of an ENTIRE class: every distinct {@code invoke-*} target across all its methods. */
+    public void handleXrefsFromClass(Context ctx) {
+        String className = require(ctx, "class_name");
+        if (className == null) return;
+        try {
+            JavaClass cls = find(className);
+            if (cls == null) {
+                Errors.send(ctx, 404, "Class not found: " + className, logger);
+                return;
+            }
+            String smali = safeSmali(cls);
+            if (smali == null || smali.isEmpty()) {
+                Errors.send(ctx, 404, "No smali available for " + cls.getFullName(), logger);
+                return;
+            }
+            List<Map<String, Object>> callees = calleesOfClass(smali);
+            Map<String, Object> out = Pagination.paginate(ctx, callees, "xrefs-from", "callees", r -> r);
+            out.put("class", cls.getFullName());
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Failed to find outgoing calls: " + e.getMessage(), e, logger);
+        }
+    }
+
+    // ---- smali invoke parsing (outgoing-call extraction) ----
+
+    /** Invoke targets inside the smali block of {@code methodName} (all overloads if descriptor is blank). */
+    private static List<Map<String, Object>> calleesOfMethod(String smali, String methodName, String descriptor) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        boolean inTarget = false;
+        for (String raw : smali.split("\n")) {
+            String line = raw.trim();
+            if (!inTarget) {
+                if (line.startsWith(".method ")) {
+                    String sig = methodSignature(line); // "name(args)ret"
+                    if (sig != null && methodName.equals(sigName(sig)) && descMatches(sig, descriptor)) {
+                        inTarget = true;
+                    }
+                }
+            } else if (line.startsWith(".end method")) {
+                inTarget = false;
+            } else if (line.startsWith("invoke")) {
+                addInvoke(line, out, seen);
+            }
+        }
+        return out;
+    }
+
+    /** Every distinct invoke target in the whole class smali. */
+    private static List<Map<String, Object>> calleesOfClass(String smali) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (String raw : smali.split("\n")) {
+            String line = raw.trim();
+            if (line.startsWith("invoke")) addInvoke(line, out, seen);
+        }
+        return out;
+    }
+
+    private static void addInvoke(String line, List<Map<String, Object>> out, Set<String> seen) {
+        Map<String, Object> t = parseInvokeTarget(line);
+        if (t == null) return;
+        String key = t.get("class") + "->" + t.get("method") + t.get("descriptor");
+        if (seen.add(key)) out.add(t);
+    }
+
+    /**
+     * Parse a smali invoke line into {class (dotted), method, descriptor}. Handles all invoke-*
+     * variants (the {@code , L<owner>;-><name>(<args>)<ret>} tail is identical across them).
+     * Returns null for invoke-custom / polymorphic forms that lack that tail.
+     */
+    private static Map<String, Object> parseInvokeTarget(String line) {
+        int owner = line.indexOf(", L");
+        if (owner < 0) return null;
+        int arrow = line.indexOf(";->", owner);
+        if (arrow < 0) return null;
+        int paren = line.indexOf('(', arrow);
+        if (paren < 0) return null;
+        String ownerSmali = line.substring(owner + 3, arrow); // between ", L" and ";"
+        String method = line.substring(arrow + 3, paren);      // between ";->" and "("
+        String descriptor = line.substring(paren);             // "(args)ret"
+        Map<String, Object> m = new HashMap<>();
+        m.put("class", ownerSmali.replace('/', '.'));
+        m.put("method", method);
+        m.put("descriptor", descriptor);
+        return m;
+    }
+
+    /** Extract the "name(args)ret" signature token from a ".method <mods> name(args)ret" line. */
+    private static String methodSignature(String methodLine) {
+        int paren = methodLine.indexOf('(');
+        if (paren < 0) return null;
+        int start = methodLine.lastIndexOf(' ', paren);
+        if (start < 0) return null;
+        return methodLine.substring(start + 1);
+    }
+
+    private static String sigName(String sig) {
+        int paren = sig.indexOf('(');
+        return paren < 0 ? sig : sig.substring(0, paren);
+    }
+
+    /** Lenient overload match: blank descriptor matches any; otherwise accept the full sig or its "(args)ret" tail. */
+    private static boolean descMatches(String sig, String descriptor) {
+        if (descriptor == null || descriptor.isEmpty()) return true;
+        if (sig.equals(descriptor)) return true;
+        int paren = sig.indexOf('(');
+        String tail = paren >= 0 ? sig.substring(paren) : sig;
+        return tail.equals(descriptor) || sig.endsWith(descriptor);
+    }
+
+    private static String safeSmali(JavaClass c) {
+        try {
+            return c.getSmali();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     // helpers
 
     private String require(Context ctx, String key) {

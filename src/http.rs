@@ -24,37 +24,30 @@ impl HttpClient {
         Ok(Self { base, client })
     }
 
-    pub async fn get_json<P: Serialize + ?Sized>(
-        &self,
-        path: &str,
-        params: &P,
-    ) -> Result<serde_json::Value> {
+    pub async fn get_raw<P: Serialize + ?Sized>(&self, path: &str, params: &P) -> Result<String> {
         let url = self.base.join(path)?;
         let resp = self.client.get(url).query(params).send().await?;
-        decode_response(path, resp).await
+        decode_raw(path, resp).await
     }
 
-    pub async fn post_json<P: Serialize + ?Sized>(
-        &self,
-        path: &str,
-        params: &P,
-    ) -> Result<serde_json::Value> {
+    pub async fn post_raw<P: Serialize + ?Sized>(&self, path: &str, params: &P) -> Result<String> {
         let url = self.base.join(path)?;
         let resp = self.client.post(url).query(params).send().await?;
-        decode_response(path, resp).await
+        decode_raw(path, resp).await
     }
 }
 
-async fn decode_response(path: &str, resp: reqwest::Response) -> Result<serde_json::Value> {
+/// Decode a bridge response into a JSON *string* (never a parsed `Value`). Success bodies that
+/// are already JSON pass through untouched — no parse + re-serialize — and the only raw-text
+/// routes (class-source, smali) get wrapped as `{"content": ...}`. On HTTP error, the bridge's
+/// structured `{error,status}` envelope is passed through as the tool result so the LLM sees the
+/// detail; an empty/odd error body bails with a pointer to the bridge log.
+async fn decode_raw(path: &str, resp: reqwest::Response) -> Result<String> {
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        // Try to parse as JSON error envelope; fall back to raw text. If the
-        // body is empty (Jetty/Javalin can do that when an exception escapes
-        // the handler without going through our error helper), surface a
-        // pointer to the bridge log instead of "HTTP 500:" with nothing after.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            return Ok(v);
+        if looks_like_json(&body) {
+            return Ok(body);
         }
         if body.trim().is_empty() {
             anyhow::bail!(
@@ -66,9 +59,18 @@ async fn decode_response(path: &str, resp: reqwest::Response) -> Result<serde_js
         }
         anyhow::bail!("bridge returned HTTP {} for {}: {}", status, path, body);
     }
-    // Some bridge routes return raw text (e.g. class source). Wrap it.
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => Ok(v),
-        Err(_) => Ok(serde_json::json!({ "content": body })),
+    if looks_like_json(&body) {
+        Ok(body)
+    } else {
+        // Raw text (class source / smali) -> wrap so the tool result stays valid JSON.
+        Ok(serde_json::json!({ "content": body }).to_string())
     }
+}
+
+/// Cheap structural check: does the (trimmed) body start like a JSON object/array? Every bridge
+/// JSON route returns an object; the only non-JSON bodies are decompiled source / smali, which
+/// start with `package`, `.class`, a comment, or whitespace.
+fn looks_like_json(body: &str) -> bool {
+    let t = body.trim_start();
+    t.starts_with('{') || t.starts_with('[')
 }

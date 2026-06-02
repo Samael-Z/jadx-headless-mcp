@@ -68,6 +68,14 @@ pub struct SearchClassesReq {
     /// (fast) when you can; raise this only for exhaustive code sweeps.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Treat `search_term` as a Java regular expression (matched with `.find()`), applied to
+    /// every selected location. Default false (plain substring). Enables code patterns like
+    /// `Cipher\.getInstance\("[^"]+"\)` or class-name patterns.
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// Match case-sensitively. Default false (case-insensitive), matching non-regex behavior.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -161,6 +169,9 @@ pub struct RenameMethodReq {
     pub new_name: String,
     #[serde(default)]
     pub class_name: Option<String>,
+    /// Optional method descriptor (the value from get_methods_of_class) to disambiguate overloads.
+    #[serde(default)]
+    pub descriptor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -174,4 +185,56 @@ pub struct RenameFieldReq {
 pub struct RenamePackageReq {
     pub old_package_name: String,
     pub new_package_name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClassSourcesReq {
+    /// Fully-qualified class names to fetch in ONE batch. Inner classes use `$`.
+    /// Keep it modest (≤~30) so the combined response fits the context window.
+    pub class_names: Vec<String>,
+    /// Per-class max characters (default 120000; 0 = unlimited). Each class is capped independently.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchStringConstantsReq {
+    /// Substring (default) or regex to match against DEX string-constant VALUES.
+    pub query: String,
+    /// Treat `query` as a Java regular expression (matched with `.find()`). Default false.
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// Match case-sensitively. Default false.
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+    /// Optional package prefix filter (e.g. "com.example.app").
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct XrefsFromMethodReq {
+    pub class_name: String,
+    pub method_name: String,
+    /// Optional smali descriptor `(args)ret` (e.g. `(Ljava/lang/String;)V`) to scope to one overload.
+    /// Omit to merge callees of all overloads.
+    #[serde(default)]
+    pub descriptor: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct XrefsFromClassReq {
+    pub class_name: String,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
 }

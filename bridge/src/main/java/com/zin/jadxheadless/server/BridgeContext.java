@@ -1,14 +1,21 @@
 package com.zin.jadxheadless.server;
 
 import com.zin.jadxheadless.util.DecompilationCache;
+import com.zin.jadxheadless.util.RenameStore;
 import com.zin.jadxheadless.util.StringIndex;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
+import jadx.api.data.ICodeRename;
+import jadx.api.data.IJavaNodeRef;
+import jadx.api.data.impl.JadxCodeData;
+import jadx.api.data.impl.JadxCodeRename;
+import jadx.api.data.impl.JadxNodeRef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +42,7 @@ public final class BridgeContext {
     private final File apkFile;
     private final DecompilationCache cache = new DecompilationCache();
     private final StringIndex stringIndex = new StringIndex();
+    private final RenameStore renameStore = new RenameStore();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
     /** Cached, lazily computed snapshot of all classes including inner classes. */
@@ -70,6 +78,10 @@ public final class BridgeContext {
 
     public StringIndex stringIndex() {
         return stringIndex;
+    }
+
+    public RenameStore renameStore() {
+        return renameStore;
     }
 
     public ReadWriteLock lock() {
@@ -109,12 +121,22 @@ public final class BridgeContext {
         t.start();
     }
 
-    /**
-     * Persisted-index location: {@code <apk-dir>/.jadx-mcp-cache/<apk-name>.<size>.stridx}.
-     * Keyed by APK name + byte size so a changed/replaced APK rebuilds automatically.
-     * Falls back to the temp dir if the APK's directory is not writable.
-     */
+    /** Persisted string-index location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.stridx}). */
     private Path stringIndexFile() {
+        return cacheFile(".stridx");
+    }
+
+    /** Persisted user-rename journal location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.renames.json}). */
+    private Path renameStoreFile() {
+        return cacheFile(".renames.json");
+    }
+
+    /**
+     * Resolve a per-APK cache file under {@code <apk-dir>/.jadx-mcp-cache/} (or the temp dir if the
+     * APK's directory is not writable). Keyed by APK name + byte size so a changed APK gets fresh
+     * files; {@code suffix} distinguishes the artifact (.stridx, .renames.json).
+     */
+    private Path cacheFile(String suffix) {
         try {
             File parent = apkFile.getAbsoluteFile().getParentFile();
             File dir;
@@ -123,9 +145,91 @@ public final class BridgeContext {
             } else {
                 dir = new File(System.getProperty("java.io.tmpdir"), "jadx-mcp-cache");
             }
-            String name = apkFile.getName() + "." + apkFile.length() + ".stridx";
-            return new File(dir, name).toPath();
+            return new File(dir, apkFile.getName() + "." + apkFile.length() + suffix).toPath();
         } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Lazily ensure a {@link JadxCodeData} is attached to the decompiler args. This is jadx's
+     * headless store for user renames; the GUI's NodeRenamedByUser path needs jadx-gui's
+     * RenameService (absent here), so renames must go through code-data + {@code reloadCodeData()}.
+     */
+    private JadxCodeData ensureCodeData() {
+        JadxCodeData cd = (JadxCodeData) jadx.getArgs().getCodeData();
+        if (cd == null) {
+            cd = new JadxCodeData();
+            cd.setRenames(new ArrayList<>());
+            cd.setComments(new ArrayList<>());
+            jadx.getArgs().setCodeData(cd);
+        }
+        return cd;
+    }
+
+    /**
+     * Apply a rename the headless way and (optionally) journal it for cross-restart persistence:
+     * add a {@link JadxCodeRename} to the code-data, fire {@code reloadCodeData()} so jadx's
+     * RenameVisitor re-applies it on next decompile, then clear the now-stale decompilation cache
+     * and FQN index. Re-renaming the same node replaces its prior entry.
+     */
+    public synchronized void applyAndRecordRename(JadxNodeRef ref, String newName, boolean persist) {
+        JadxCodeData cd = ensureCodeData();
+        List<ICodeRename> list = new ArrayList<>(cd.getRenames());
+        list.removeIf(r -> ref.equals(r.getNodeRef()));
+        list.add(new JadxCodeRename(ref, newName));
+        cd.setRenames(list);
+        jadx.reloadCodeData();
+        cache.clear();
+        invalidateClassIndex();
+        if (persist) {
+            Map<String, String> rec = new HashMap<>();
+            rec.put("type", ref.getType().name());
+            rec.put("cls", ref.getDeclaringClass());
+            if (ref.getShortId() != null) rec.put("id", ref.getShortId());
+            rec.put("new", newName == null ? "" : newName);
+            renameStore.record(rec);
+        }
+    }
+
+    /**
+     * Load the persisted rename journal and re-apply every rename in one batch (see
+     * {@link RenameStore}). Call once at startup AFTER the model is loaded and BEFORE serving, so a
+     * reconnecting client sees prior renames already applied. Also arms the store to persist new
+     * renames. Records that no longer resolve are carried in code-data and harmlessly ignored by jadx.
+     */
+    public void loadAndReplayRenames() {
+        Path f = renameStoreFile();
+        if (f == null) return;
+        int loaded = renameStore.load(f);
+        renameStore.setFile(f); // persist new renames regardless of whether anything was loaded
+        if (loaded == 0) return;
+        JadxCodeData cd = ensureCodeData();
+        List<ICodeRename> list = new ArrayList<>(cd.getRenames());
+        int applied = 0;
+        for (Map<String, String> rec : renameStore.all()) {
+            JadxNodeRef ref = refFromRecord(rec);
+            String newName = rec.get("new");
+            if (ref == null || newName == null) continue;
+            list.removeIf(r -> ref.equals(r.getNodeRef()));
+            list.add(new JadxCodeRename(ref, newName));
+            applied++;
+        }
+        cd.setRenames(list);
+        jadx.reloadCodeData();
+        cache.clear();
+        invalidateClassIndex();
+        logger.info("[renames] replayed {}/{} persisted renames", applied, loaded);
+    }
+
+    /** Rebuild a {@link JadxNodeRef} from a journal record ({@code type}, {@code cls}, {@code id}). */
+    private static JadxNodeRef refFromRecord(Map<String, String> rec) {
+        String type = rec.get("type");
+        String cls = rec.get("cls");
+        if (type == null || cls == null) return null;
+        try {
+            return new JadxNodeRef(IJavaNodeRef.RefType.valueOf(type), cls, rec.get("id"));
+        } catch (Exception e) {
             return null;
         }
     }

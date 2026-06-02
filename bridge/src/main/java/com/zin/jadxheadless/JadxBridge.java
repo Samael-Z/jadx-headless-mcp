@@ -97,6 +97,14 @@ public class JadxBridge {
         // Handshake: emit port and READY on stdout (single bytes flushed)
         PrintStream out = System.out;
         out.println("PORT=" + actualPort);
+        // Replay any persisted user-renames BEFORE announcing READY, so a reconnecting client
+        // sees its prior renames already applied to the freshly loaded model. (jadx only writes
+        // user-rename mappings from the GUI; headless journals + replays them itself.)
+        try {
+            context.loadAndReplayRenames();
+        } catch (Throwable t) {
+            System.err.println("[jadx-bridge] rename replay failed (continuing): " + t);
+        }
         out.println("READY");
         out.flush();
         System.err.println("[jadx-bridge] Listening on http://" + cli.host + ":" + actualPort);

@@ -51,6 +51,9 @@ public final class ClassRoutes {
      */
     private static final long DEFAULT_SEARCH_TIMEOUT_MS = 25_000;
 
+    /** Hard cap on classes fetched per {@code /class-sources} batch — keeps the combined response bounded. */
+    private static final int MAX_BATCH_CLASSES = 200;
+
     /** Search modes for the keyword search route. */
     public enum SearchLocation { CLASS_NAME, METHOD_NAME, FIELD_NAME, CODE, COMMENT }
 
@@ -108,6 +111,86 @@ public final class ClassRoutes {
             ctx.result(TextUtil.cap(decompiledCode(cls), TextUtil.maxChars(ctx)));
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to decompile class: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /**
+     * Batch sibling of {@link #handleClassSource}: decompile MANY classes in ONE request.
+     * {@code class_names} is a comma-separated FQN list (inner classes use {@code $}). Cuts the
+     * per-class round-trip overhead when the caller already knows the set it wants (e.g. after a
+     * search or xrefs lookup). Classes are decompiled in parallel and each is capped independently
+     * by {@code max_chars}. Unknown names are reported in {@code not_found} rather than failing the
+     * whole batch.
+     */
+    public void handleClassSources(Context ctx) {
+        String namesParam = ctx.queryParam("class_names");
+        if (namesParam == null || namesParam.isEmpty()) {
+            Errors.send(ctx, 400, "Missing required parameter 'class_names' (comma-separated FQNs)", logger);
+            return;
+        }
+        final int maxChars = TextUtil.maxChars(ctx);
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (String s : namesParam.split(",")) {
+            String n = s.trim();
+            if (!n.isEmpty()) names.add(n);
+        }
+        boolean batchCapped = names.size() > MAX_BATCH_CLASSES;
+        if (batchCapped) {
+            names = names.stream().limit(MAX_BATCH_CLASSES)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+        }
+        final List<String> ordered = new ArrayList<>(names);
+        try {
+            // Parallel decompile: each class is ~1s on first touch; the shared cache makes repeats free.
+            // toConcurrentMap is safe — `ordered` is deduped (LinkedHashSet) so keys are unique.
+            Map<String, Map<String, Object>> byName = ordered.parallelStream()
+                    .collect(Collectors.toConcurrentMap(name -> name, name -> {
+                        Map<String, Object> row = new HashMap<>();
+                        JavaClass cls = findClass(name);
+                        if (cls == null) {
+                            row.put("not_found", true);
+                            return row;
+                        }
+                        row.put("name", cls.getFullName());
+                        try {
+                            String code = decompiledCode(cls);
+                            int total = code == null ? 0 : code.length();
+                            row.put("content", TextUtil.cap(code, maxChars));
+                            if (maxChars > 0 && total > maxChars) {
+                                row.put("truncated", true);
+                                row.put("total_chars", total);
+                            }
+                        } catch (Exception e) {
+                            row.put("content", "// Error decompiling: " + e.getMessage());
+                            row.put("error", true);
+                        }
+                        return row;
+                    }));
+            List<Map<String, Object>> classes = new ArrayList<>();
+            List<String> notFound = new ArrayList<>();
+            for (String name : ordered) {
+                Map<String, Object> row = byName.get(name);
+                if (row == null) continue;
+                if (Boolean.TRUE.equals(row.get("not_found"))) {
+                    notFound.add(name);
+                } else {
+                    classes.add(row);
+                }
+            }
+            Map<String, Object> out = new HashMap<>();
+            out.put("type", "class-sources");
+            out.put("requested", ordered.size());
+            out.put("returned", classes.size());
+            out.put("classes", classes);
+            if (!notFound.isEmpty()) out.put("not_found", notFound);
+            if (batchCapped) {
+                out.put("batch_capped", true);
+                out.put("note", "Batch limited to the first " + MAX_BATCH_CLASSES
+                        + " distinct names; request the rest in another call.");
+            }
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Failed to batch-fetch class sources: " + e.getMessage(), e, logger);
         }
     }
 
@@ -291,26 +374,47 @@ public final class ClassRoutes {
         int offset = parsePositive(ctx, "offset", 0);
         int count = parsePositive(ctx, "count", parsePositive(ctx, "limit", 0));
         int cap = count > 0 ? offset + count : 0;
+        boolean regex = "true".equalsIgnoreCase(ctx.queryParam("regex"));
+        boolean caseSensitive = "true".equalsIgnoreCase(ctx.queryParam("case_sensitive"));
+
+        // Unified text matcher used by every location: a regex .find() when regex=true,
+        // otherwise a (case-sensitive or -insensitive) substring test. This is what makes
+        // search_in=code support `Cipher\.getInstance\("[^"]+"\)`-style queries without a
+        // second code path. Compiled once per request (per-class compilation across 100k+
+        // classes would itself dominate runtime).
+        final java.util.regex.Pattern pat;
+        if (regex) {
+            try {
+                pat = Pattern.compile(term, caseSensitive ? 0 : Pattern.CASE_INSENSITIVE);
+            } catch (java.util.regex.PatternSyntaxException pe) {
+                Errors.send(ctx, 400, "Invalid regex '" + term + "': " + pe.getMessage(), logger);
+                return;
+            }
+        } else {
+            pat = null;
+        }
+        final String tCase = term;
+        final String tLower = term.toLowerCase();
+        final java.util.function.Predicate<String> textMatch = pat != null
+                ? s -> s != null && pat.matcher(s).find()
+                : (caseSensitive
+                        ? s -> s != null && s.contains(tCase)
+                        : s -> s != null && s.toLowerCase().contains(tLower));
 
         try {
             List<JavaClass> all = context.getClassesWithInners();
-            String t = term.toLowerCase();
             boolean filterPkg = isValidPackageFilter(packageFilter);
 
             Set<JavaClass> matched = new LinkedHashSet<>();
             boolean timedOut = false;
             int scanned = 0;
-            // Precompiled once per request for the COMMENT scan -- compiling these per
-            // class across 100k+ classes would itself dominate runtime.
-            Pattern commentSingle = Pattern.compile("//.*?" + Pattern.quote(t) + ".*", Pattern.CASE_INSENSITIVE);
-            Pattern commentMulti = Pattern.compile("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", Pattern.DOTALL);
 
             for (SearchLocation loc : locations) {
                 // CLASS/METHOD/FIELD name matching is cheap string work (no decompile)
                 // -- the existing fast path returns in well under a second. CODE/COMMENT
                 // decompile every class, so they go through the time-bounded scan.
                 if (loc != SearchLocation.CODE && loc != SearchLocation.COMMENT) {
-                    matched.addAll(searchIn(all, t, loc, packageFilter, filterPkg));
+                    matched.addAll(searchIn(all, textMatch, loc, packageFilter, filterPkg));
                     continue;
                 }
                 final SearchLocation floc = loc;
@@ -324,14 +428,9 @@ public final class ClassRoutes {
                     }
                     if (code == null) return null;
                     if (floc == SearchLocation.CODE) {
-                        return code.toLowerCase().contains(t) ? c : null;
+                        return textMatch.test(code) ? c : null;
                     }
-                    if (commentSingle.matcher(code).find()) return c;
-                    java.util.regex.Matcher mm = commentMulti.matcher(code);
-                    while (mm.find()) {
-                        if (mm.group().toLowerCase().contains(t)) return c;
-                    }
-                    return null;
+                    return commentMatches(code, textMatch) ? c : null;
                 });
                 matched.addAll(sr.hits);
                 timedOut |= sr.timedOut;
@@ -339,6 +438,7 @@ public final class ClassRoutes {
             }
             Map<String, Object> out = Pagination.paginate(
                     new ArrayList<>(matched), "class-list", "classes", offset, count, JavaClass::getFullName);
+            if (regex) out.put("regex", true);
             if (timedOut) {
                 out.put("timed_out", true);
                 out.put("scanned", scanned);
@@ -745,6 +845,60 @@ public final class ClassRoutes {
         ctx.json(context.stringIndex().statusMap());
     }
 
+    /**
+     * Discovery search over the DEX string-constant pool: list embedded string CONSTANTS whose
+     * value matches {@code query} (substring by default, or {@code regex=true}) plus the classes
+     * that declare each. Powered by the const-string inverted index, so it is sub-second even on
+     * a 100k+ class APK — the opposite end from {@link #handleFindStringUsages}, which takes an
+     * EXACT literal and returns its usages. Use this to enumerate URLs, API keys, crypto
+     * constants, etc. ("show every string containing 'http' / matching a base64 pattern").
+     */
+    public void handleSearchStringConstants(Context ctx) {
+        String query = ctx.queryParam("query");
+        if (query == null || query.isEmpty()) {
+            Errors.send(ctx, 400, "Missing required parameter 'query'", logger);
+            return;
+        }
+        boolean regex = "true".equalsIgnoreCase(ctx.queryParam("regex"));
+        String caseParam = ctx.queryParam("case_sensitive");
+        boolean caseSensitive = caseParam != null && caseParam.equalsIgnoreCase("true");
+        String packageFilter = ctx.queryParam("package");
+        int offset = parsePositive(ctx, "offset", 0);
+        int count = parsePositive(ctx, "count", 100);
+        // Over-fetch by one so pagination can report has_more accurately when the index search caps.
+        int searchCap = count > 0 ? offset + count + 1 : 0;
+        try {
+            List<Map<String, Object>> hits;
+            try {
+                hits = context.stringIndex().searchKeys(query, caseSensitive, regex,
+                        isValidPackageFilter(packageFilter) ? packageFilter : null, searchCap);
+            } catch (java.util.regex.PatternSyntaxException pe) {
+                Errors.send(ctx, 400, "Invalid regex '" + query + "': " + pe.getMessage(), logger);
+                return;
+            }
+            if (hits == null) {
+                // Index not READY: report status rather than silently launching a minutes-long live scan.
+                String st = context.stringIndex().status().name().toLowerCase();
+                Map<String, Object> out = new HashMap<>();
+                out.put("type", "string-constants");
+                out.put("index", st);
+                out.put("query", query);
+                out.put("results", new ArrayList<>());
+                out.put("note", "String index not ready (" + st + "). Retry shortly (poll index_status). "
+                        + "For an exact known literal, find_string_usages works without the index.");
+                ctx.json(out);
+                return;
+            }
+            Map<String, Object> out = Pagination.paginate(hits, "string-constants", "results", offset, count, x -> x);
+            out.put("index", "ready");
+            out.put("query", query);
+            if (regex) out.put("regex", true);
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Search string constants failed: " + e.getMessage(), e, logger);
+        }
+    }
+
     public void handleCacheClear(Context ctx) {
         context.cache().clear();
         ctx.json(Map.of("status", "cleared", "stats", context.cache().stats()));
@@ -815,21 +969,37 @@ public final class ClassRoutes {
         return full.startsWith(filter + ".") || full.equals(filter);
     }
 
-    private Set<JavaClass> searchIn(List<JavaClass> all, String term, SearchLocation loc,
-                                    String packageFilter, boolean filterPkg) {
+    /**
+     * Single-line ({@code //...}) and block comment extractor. We match each comment span,
+     * then apply the caller's text predicate to its body — this routes regex and substring
+     * comment search through the same path as code/name search.
+     */
+    private static final Pattern COMMENT_EXTRACT =
+            Pattern.compile("//[^\\n]*|/\\*.*?\\*/", Pattern.DOTALL);
+
+    private static boolean commentMatches(String code, java.util.function.Predicate<String> textMatch) {
+        java.util.regex.Matcher m = COMMENT_EXTRACT.matcher(code);
+        while (m.find()) {
+            if (textMatch.test(m.group())) return true;
+        }
+        return false;
+    }
+
+    private Set<JavaClass> searchIn(List<JavaClass> all, java.util.function.Predicate<String> textMatch,
+                                    SearchLocation loc, String packageFilter, boolean filterPkg) {
         switch (loc) {
             case CLASS_NAME:
                 return all.parallelStream()
                         .filter(c -> (!filterPkg || matchesPackageFilter(c, packageFilter))
-                                && c.getName().toLowerCase().contains(term))
+                                && textMatch.test(c.getName()))
                         .collect(Collectors.toCollection(LinkedHashSet::new));
             case METHOD_NAME:
                 return all.parallelStream()
                         .filter(c -> {
                             if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
                             for (JavaMethod m : c.getMethods()) {
-                                if (m.getName().toLowerCase().contains(term)) return true;
-                                if (m.isConstructor() && c.getName().toLowerCase().contains(term)) return true;
+                                if (textMatch.test(m.getName())) return true;
+                                if (m.isConstructor() && textMatch.test(c.getName())) return true;
                             }
                             return false;
                         })
@@ -839,7 +1009,7 @@ public final class ClassRoutes {
                         .filter(c -> {
                             if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
                             for (JavaField f : c.getFields()) {
-                                if (f.getName().toLowerCase().contains(term)) return true;
+                                if (textMatch.test(f.getName())) return true;
                             }
                             return false;
                         })
@@ -850,27 +1020,19 @@ public final class ClassRoutes {
                             try {
                                 if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
                                 String code = decompiledCode(c);
-                                return code != null && code.toLowerCase().contains(term);
+                                return code != null && textMatch.test(code);
                             } catch (Exception e) {
                                 return false;
                             }
                         })
                         .collect(Collectors.toCollection(LinkedHashSet::new));
             case COMMENT:
-                Pattern singleLine = Pattern.compile("//.*?" + Pattern.quote(term) + ".*", Pattern.CASE_INSENSITIVE);
-                Pattern multiLine = Pattern.compile("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", Pattern.DOTALL);
                 return all.parallelStream()
                         .filter(c -> {
                             try {
                                 if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
                                 String code = decompiledCode(c);
-                                if (code == null) return false;
-                                if (singleLine.matcher(code).find()) return true;
-                                java.util.regex.Matcher mm = multiLine.matcher(code);
-                                while (mm.find()) {
-                                    if (mm.group().toLowerCase().contains(term)) return true;
-                                }
-                                return false;
+                                return code != null && commentMatches(code, textMatch);
                             } catch (Exception e) {
                                 return false;
                             }
@@ -893,7 +1055,7 @@ public final class ClassRoutes {
      * Best-effort method descriptor (parameter type list). Falls back to "" if jadx
      * doesn't expose it cleanly — never throws, since this is metadata enrichment.
      */
-    static String safeDescriptor(JavaMethod m) {
+    public static String safeDescriptor(JavaMethod m) {
         try {
             jadx.core.dex.nodes.MethodNode mn = m.getMethodNode();
             if (mn == null) return "";

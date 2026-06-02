@@ -22,6 +22,8 @@ req=$(cat <<'EOF'
 {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_android_manifest","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"index_status","arguments":{}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_string_constants","arguments":{"query":"http","count":3}}}
 EOF
 )
 
@@ -37,16 +39,16 @@ pid=$!
 
 trap 'kill -TERM "$pid" 2>/dev/null || true' EXIT
 
-# Wait up to 5 minutes for at least 3 response lines (init reply + tools/list + tool call).
+# Wait up to 5 minutes for all response lines (init reply + tools/list + 3 tool calls).
 deadline=$(( $(date +%s) + 300 ))
 while [[ $(date +%s) -lt "$deadline" ]]; do
   lines=$(wc -l < "$stdout_log" 2>/dev/null || echo 0)
-  if [[ "$lines" -ge 3 ]]; then break; fi
+  if [[ "$lines" -ge 5 ]]; then break; fi
   sleep 2
 done
 
-echo "--- stdout (first 4 lines) ---"
-head -n 4 "$stdout_log"
+echo "--- stdout (first 6 lines) ---"
+head -n 6 "$stdout_log"
 echo "--- stderr tail ---"
 tail -n 30 "$stderr_log"
 echo "---"

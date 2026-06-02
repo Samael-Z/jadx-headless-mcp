@@ -150,15 +150,15 @@ jadx-mcp --jvm-arg=-Xmx4g
 
 ## 暴露的工具
 
-六大类共 27 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
+六大类共 32 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
 
 | 类别 | 工具 |
 |---|---|
 | **会话** | `load_apk`、`current_apk` |
-| **类相关** | `get_all_classes`、`get_class_source`、`get_methods_of_class`、`get_fields_of_class`、`get_smali_of_class`、`get_main_activity_class`、`get_main_application_classes_names`、`get_main_application_classes_code`、`get_package_tree`、`search_classes_by_keyword`、`get_cache_stats`、`clear_cache` |
+| **类相关** | `get_all_classes`、`get_class_source`、`get_class_sources`（批量）、`get_methods_of_class`、`get_fields_of_class`、`get_smali_of_class`、`get_main_activity_class`、`get_main_application_classes_names`、`get_main_application_classes_code`、`get_package_tree`、`search_classes_by_keyword`（子串或 `regex=true`）、`search_string_constants`、`get_cache_stats`、`clear_cache`、`index_status` |
 | **方法相关** | `get_method_by_name`、`search_method_by_name` |
 | **资源相关** | `get_android_manifest`、`get_strings`、`get_all_resource_file_names`、`get_resource_file` |
-| **交叉引用** | `get_xrefs_to_class`、`get_xrefs_to_method`、`get_xrefs_to_field` |
+| **交叉引用** | `get_xrefs_to_class`、`get_xrefs_to_method`、`get_xrefs_to_field`、`get_xrefs_from_method`、`get_xrefs_from_class` |
 | **重命名** | `rename_class`、`rename_method`、`rename_field`、`rename_package` |
 
 典型分析流程：
@@ -167,13 +167,14 @@ jadx-mcp --jvm-arg=-Xmx4g
 load_apk { path: "/绝对路径/到/app.apk" }          → 加载 APK（约 30 秒）
 get_package_tree                                  → 看 APK 整体结构，找到应用包名
 get_main_application_classes_names                → 列出业务方代码（过滤掉三方库）
-get_class_source { class_name: "..." }            → 看反编译源码
-get_xrefs_to_method { class_name, method_name }   → 追调用链
-search_classes_by_keyword { search_term, ... }    → 跨包全文搜索
+get_class_source { class_name: "..." }            → 看反编译源码（get_class_sources 可批量）
+search_classes_by_keyword { search_term, ... }    → 跨包全文 / 正则搜索
+search_string_constants { query: "https://" }      → 枚举内嵌 URL / 密钥及所属类
+get_xrefs_to_method { class_name, method_name }   → 追调用链（get_xrefs_from_* 查出边）
 load_apk { path: "/另一个/app.apk" }               → 会话内切换 APK
 ```
 
-**重命名仅在内存生效** —— 当前会话里的后续工具调用能看到改名结果，但不会持久化到磁盘。
+**重命名跨重启持久化** —— 通过 jadx 的 code-data 机制应用，并 journal 到 APK 旁的 `.jadx-mcp-cache/<apk>.renames.json`，下次加载该 APK 时自动 replay。
 
 ## 从源码构建
 
@@ -202,7 +203,7 @@ cargo build --release
 
 - **不包含** JADX-GUI 的调试器功能（`debug_get_stack_frames` 等）—— 这些需要活动的 GUI，已经移除。
 - **不暴露** `fetch_current_class` / `get_selected_text` —— 无 UI 环境下没有"当前选中"的概念，请直接把 FQN 传给 `get_class_source`。
-- 重命名暂不持久化到 `.jobf` mappings 文件。集成 `jadx-rename-mappings` 插件在 roadmap 上。
+- 变量重命名仍不支持（需要 GUI 的类重载耦合）。类 / 方法 / 字段 / 包重命名已生效且**跨重启持久化**（经 jadx code-data 应用，journal 到 APK 旁）。
 
 ## 致谢
 

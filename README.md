@@ -150,15 +150,15 @@ The 2 GB default is a **baseline**: passing your own `-Xmx` overrides the heap, 
 
 ## Tools exposed
 
-Twenty-seven tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
+Thirty-two tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
 
 | Category | Tool |
 |---|---|
 | **Session** | `load_apk`, `current_apk` |
-| **Classes** | `get_all_classes`, `get_class_source`, `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword`, `get_cache_stats`, `clear_cache` |
+| **Classes** | `get_all_classes`, `get_class_source`, `get_class_sources` (batch), `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword` (substring or `regex=true`), `search_string_constants`, `get_cache_stats`, `clear_cache`, `index_status` |
 | **Methods** | `get_method_by_name`, `search_method_by_name` |
 | **Resources** | `get_android_manifest`, `get_strings`, `get_all_resource_file_names`, `get_resource_file` |
-| **Xrefs** | `get_xrefs_to_class`, `get_xrefs_to_method`, `get_xrefs_to_field` |
+| **Xrefs** | `get_xrefs_to_class`, `get_xrefs_to_method`, `get_xrefs_to_field`, `get_xrefs_from_method`, `get_xrefs_from_class` |
 | **Renames** | `rename_class`, `rename_method`, `rename_field`, `rename_package` |
 
 A typical analysis flow:
@@ -167,13 +167,14 @@ A typical analysis flow:
 load_apk { path: "/abs/path/to/app.apk" }         → point the server at an APK (~30s for jadx to load)
 get_package_tree                                  → see APK structure, find app package
 get_main_application_classes_names                → enumerate first-party classes
-get_class_source { class_name: "..." }            → read decompiled source
-get_xrefs_to_method { class_name, method_name }   → trace callers
-search_classes_by_keyword { search_term, ... }    → free-text search across packages
+get_class_source { class_name: "..." }            → read decompiled source (get_class_sources for a batch)
+search_classes_by_keyword { search_term, ... }    → free-text / regex search across packages
+search_string_constants { query: "https://" }     → enumerate embedded URLs / keys + their classes
+get_xrefs_to_method { class_name, method_name }   → trace callers (get_xrefs_from_* for callees)
 load_apk { path: "/path/to/other.apk" }           → switch to a different APK in-session
 ```
 
-Renames are in-memory only — visible to subsequent tool calls in the same session, not persisted to disk.
+Renames **persist across restarts**: they're applied through jadx's code-data mechanism and journaled next to the APK (`.jadx-mcp-cache/<apk>.renames.json`), then replayed automatically the next time that APK is loaded.
 
 ## Building from source
 
@@ -202,7 +203,7 @@ The build script (`build.rs`) finds the JAR in `bridge/target/jadx-bridge.jar` b
 
 - It does **not** include the JADX-GUI debugger features (`debug_get_stack_frames`, etc.) — those require a live GUI and were dropped.
 - It does **not** call `fetch_current_class` or `get_selected_text` — those make no sense without a UI; supply the FQN to `get_class_source` instead.
-- Renames don't persist to a `.jobf` mappings file. Wiring up the `jadx-rename-mappings` plugin is on the roadmap.
+- Variable renames aren't supported (they need GUI class-reload coupling). Class / method / field / package renames work and **persist across restarts** (applied via jadx code-data, journaled next to the APK).
 
 ## Acknowledgements
 

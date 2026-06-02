@@ -63,6 +63,11 @@ impl JadxMcpServer {
         // succeeded, so canonicalize() shouldn't fail — but if it does (e.g.,
         // symlink loops), fall back to the original path rather than refusing to load.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // Strip Windows' verbatim `\\?\` prefix that canonicalize() always adds. jadx's loader
+        // calls File.toPath() internally, and Java NIO's WindowsPathParser rejects `\\?\` with
+        // InvalidPathException ("Illegal character [?]") on at least JDK <= 17 — which makes the
+        // bridge exit 4 before READY. A plain path loads on every JDK.
+        let path = strip_verbatim_prefix(path);
 
         // Spawn the new bridge BEFORE shutting down the old one. If the spawn
         // fails, the current bridge keeps serving tool calls instead of leaving
@@ -133,8 +138,11 @@ impl JadxMcpServer {
             Ok(c) => c,
             Err(e) => return e.to_tool_result(),
         };
-        match client.get_json(path, query).await {
-            Ok(v) => Self::ok(v),
+        match client.get_raw(path, query).await {
+            // The bridge already produced JSON text; forward it verbatim rather than parsing
+            // into a Value and re-serializing. On multi-MB class-source / smali / manifest
+            // payloads that round-trip of (de)serialization is pure overhead.
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
             Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
         }
     }
@@ -144,8 +152,8 @@ impl JadxMcpServer {
             Ok(c) => c,
             Err(e) => return e.to_tool_result(),
         };
-        match client.post_json(path, query).await {
-            Ok(v) => Self::ok(v),
+        match client.post_raw(path, query).await {
+            Ok(body) => CallToolResult::success(vec![Content::text(body)]),
             Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
         }
     }
@@ -155,6 +163,24 @@ impl JadxMcpServer {
 pub struct LoadedApkInfo {
     pub apk: String,
     pub bridge_port: u16,
+}
+
+/// Remove Windows' `\\?\` verbatim/extended-length prefix from a canonicalized path.
+/// `std::fs::canonicalize` always adds it on Windows, but Java NIO (jadx's loader) rejects it.
+/// No-op on non-Windows and on paths without the prefix; UNC paths become `\\server\share`.
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(s) = p.to_str() {
+            if let Some(rest) = s.strip_prefix(r"\\?\") {
+                if let Some(unc) = rest.strip_prefix(r"UNC\") {
+                    return PathBuf::from(format!(r"\\{unc}"));
+                }
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    p
 }
 
 fn pagination_qs(offset: &Option<u32>, count: &Option<u32>) -> Vec<(&'static str, String)> {
@@ -236,6 +262,22 @@ impl JadxMcpServer {
         Ok(self.get("/class-source", &q).await)
     }
 
+    #[tool(description = "Batch-fetch decompiled Java source for MANY classes in ONE call — far fewer \
+                          round-trips than get_class_source per class when you already have the set you \
+                          want (e.g. from search results or xrefs). Returns { classes: [{name, content, \
+                          truncated?, total_chars?}], not_found: [...] }. Each class is capped independently \
+                          by max_chars. Keep the batch modest (≤~30) so the combined response fits the context window.")]
+    async fn get_class_sources(
+        &self,
+        Parameters(req): Parameters<ClassSourcesReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q = vec![("class_names", req.class_names.join(","))];
+        if let Some(m) = req.max_chars {
+            q.push(("max_chars", m.to_string()));
+        }
+        Ok(self.get("/class-sources", &q).await)
+    }
+
     #[tool(description = "List all methods declared on a class. Returns name, full_name, return_type, access_flags, is_constructor.")]
     async fn get_methods_of_class(
         &self,
@@ -299,7 +341,11 @@ impl JadxMcpServer {
 
     #[tool(description = "Search for classes containing a keyword. \
                           `search_in` accepts a comma-separated list of: class, method, field, code, comment. \
-                          Default is `code`. `package` optionally restricts to a package prefix.")]
+                          Default is `code`. `package` optionally restricts to a package prefix. \
+                          Set `regex=true` to treat the term as a Java regex (matched with .find(); applies \
+                          to every selected scope), `case_sensitive=true` for exact case. class/method/field \
+                          name scans are fast; code/comment scans decompile every class and are time-bounded \
+                          (see `timeout_ms`).")]
     async fn search_classes_by_keyword(
         &self,
         Parameters(req): Parameters<SearchClassesReq>,
@@ -313,6 +359,12 @@ impl JadxMcpServer {
         }
         if let Some(t) = req.timeout_ms {
             q.push(("timeout_ms", t.to_string()));
+        }
+        if let Some(b) = req.regex {
+            q.push(("regex", b.to_string()));
+        }
+        if let Some(b) = req.case_sensitive {
+            q.push(("case_sensitive", b.to_string()));
         }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/search-classes-by-keyword", &q).await)
@@ -356,9 +408,44 @@ impl JadxMcpServer {
         Ok(self.get("/find-string-usages", &q).await)
     }
 
+    #[tool(description = "Enumerate DEX string CONSTANTS whose value matches a substring (default) or \
+                          regex, with the classes that declare each. Index-backed, so it is sub-second even \
+                          on a 100k+ class APK. This is the DISCOVERY counterpart to find_string_usages \
+                          (which takes an EXACT literal and returns its usages). Use it to sweep for URLs, \
+                          API keys, crypto constants, etc. — e.g. query 'https://' or regex=true with \
+                          '[A-Za-z0-9+/]{40,}={0,2}'. Requires the index to be `ready` (see index_status); \
+                          until then it returns an empty result plus the current index state.")]
+    async fn search_string_constants(
+        &self,
+        Parameters(req): Parameters<SearchStringConstantsReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![("query", req.query)];
+        if let Some(b) = req.regex {
+            q.push(("regex", b.to_string()));
+        }
+        if let Some(b) = req.case_sensitive {
+            q.push(("case_sensitive", b.to_string()));
+        }
+        if let Some(p) = req.package {
+            q.push(("package", p));
+        }
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/search-string-constants", &q).await)
+    }
+
     #[tool(description = "Decompilation source cache statistics: hits, misses, hit_rate, cached_classes, compressed_mb.")]
     async fn get_cache_stats(&self) -> Result<CallToolResult, McpError> {
         Ok(self.get("/cache-stats", &[]).await)
+    }
+
+    #[tool(description = "Report the const-string / method-name inverted index status \
+                          (absent | building | ready | failed) plus progress (built_classes/total_classes, \
+                          distinct_strings, distinct_methods, build_ms). This index powers fast \
+                          find_string_usages, search_string_constants and search_method_by_name; until it is \
+                          `ready` those fall back to a slower bounded live scan. Poll this after load_apk on \
+                          a large APK to know when the fast path is available.")]
+    async fn index_status(&self) -> Result<CallToolResult, McpError> {
+        Ok(self.get("/index-status", &[]).await)
     }
 
     #[tool(description = "Clear the in-process decompilation source cache (used by /class-source and /search-*). \
@@ -469,10 +556,43 @@ impl JadxMcpServer {
         Ok(self.get("/xrefs-to-field", &q).await)
     }
 
+    #[tool(description = "List the OUTGOING calls (callees) of a method — the complement of \
+                          get_xrefs_to_method. Parsed from the method's smali invoke-* opcodes, so it works \
+                          even on hardened classes whose Java decompile is empty. Each callee is \
+                          {class, method, descriptor}. Omit `descriptor` to merge callees of all overloads; \
+                          pass it (smali form, e.g. (Ljava/lang/String;)V) to scope to one. Paginated.")]
+    async fn get_xrefs_from_method(
+        &self,
+        Parameters(req): Parameters<XrefsFromMethodReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![
+            ("class_name", req.class_name),
+            ("method_name", req.method_name),
+        ];
+        if let Some(d) = req.descriptor {
+            q.push(("descriptor", d));
+        }
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/xrefs-from-method", &q).await)
+    }
+
+    #[tool(description = "List every distinct OUTGOING call target across ALL methods of a class (the \
+                          callees of the whole class), parsed from its smali. A quick sketch of what a class \
+                          depends on. Paginated.")]
+    async fn get_xrefs_from_class(
+        &self,
+        Parameters(req): Parameters<XrefsFromClassReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![("class_name", req.class_name)];
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/xrefs-from-class", &q).await)
+    }
+
     // ----------------------------- Renames -----------------------------
 
-    #[tool(description = "Rename a class. The change is in-memory only — visible to subsequent tool calls in the same session, \
-                          but not persisted to disk.")]
+    #[tool(description = "Rename a class (simple name). Takes effect immediately AND persists across \
+                          restarts — applied via jadx's code-data and journaled next to the APK, then \
+                          replayed automatically on the next load.")]
     async fn rename_class(
         &self,
         Parameters(req): Parameters<RenameClassReq>,
@@ -484,7 +604,10 @@ impl JadxMcpServer {
         Ok(self.get("/rename-class", &q).await)
     }
 
-    #[tool(description = "Rename a method. In-memory only. `method_name` accepts either bare name or `ClassName.methodName`.")]
+    #[tool(description = "Rename a method. Takes effect immediately AND persists across restarts. \
+                          `method_name` accepts either a bare name or `ClassName.methodName`. If the class \
+                          has overloads of that name, pass `descriptor` (the value from get_methods_of_class) \
+                          to pick one; an ambiguous rename otherwise returns 409 with the candidates.")]
     async fn rename_method(
         &self,
         Parameters(req): Parameters<RenameMethodReq>,
@@ -496,10 +619,13 @@ impl JadxMcpServer {
         if let Some(c) = req.class_name {
             q.push(("class_name", c));
         }
+        if let Some(d) = req.descriptor {
+            q.push(("descriptor", d));
+        }
         Ok(self.get("/rename-method", &q).await)
     }
 
-    #[tool(description = "Rename a field on a class. In-memory only.")]
+    #[tool(description = "Rename a field on a class. Takes effect immediately AND persists across restarts.")]
     async fn rename_field(
         &self,
         Parameters(req): Parameters<RenameFieldReq>,
@@ -512,7 +638,8 @@ impl JadxMcpServer {
         Ok(self.get("/rename-field", &q).await)
     }
 
-    #[tool(description = "Rename every class under a package. In-memory only. Returns count of renamed/total classes and per-class errors.")]
+    #[tool(description = "Rename a package. `new_package_name` is the full target package path. Takes effect \
+                          immediately AND persists across restarts (applied via jadx code-data, journaled next to the APK).")]
     async fn rename_package(
         &self,
         Parameters(req): Parameters<RenamePackageReq>,
@@ -536,7 +663,8 @@ impl ServerHandler for JadxMcpServer {
                  STEP 3: drill in with `search_classes_by_keyword`, `get_class_source`, \
                  `get_method_by_name`, or `get_xrefs_to_*`. \
                  Call `load_apk` again with a different path at any time to switch APKs. \
-                 Renames are in-memory and do not persist across runs.",
+                 Renames (class/method/field/package) take effect immediately and persist across restarts \
+                 (journaled next to the APK, replayed on reload).",
             )
     }
 }
