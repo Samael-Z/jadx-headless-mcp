@@ -78,6 +78,10 @@ public final class ClassRoutes {
 
     private final BridgeContext context;
 
+    /** Cached package histogram (deterministic per APK) — avoids re-scanning 100k+ classes per call. */
+    private volatile List<Map.Entry<String, Integer>> packageTreeCache;
+    private volatile int packageTreeTotalClasses;
+
     public ClassRoutes(BridgeContext context) {
         this.context = context;
     }
@@ -343,17 +347,8 @@ public final class ClassRoutes {
 
     public void handlePackageTree(Context ctx) {
         try {
-            List<JavaClass> all = context.getClassesWithInners();
-            Map<String, Integer> counts = new HashMap<>();
-            for (JavaClass cls : all) {
-                String full = cls.getFullName();
-                int dot = full.lastIndexOf('.');
-                String pkg = dot > 0 ? full.substring(0, dot) : "(default)";
-                counts.merge(pkg, 1, Integer::sum);
-            }
-            List<Map.Entry<String, Integer>> sorted = counts.entrySet().stream()
-                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
-                    .collect(Collectors.toList());
+            List<Map.Entry<String, Integer>> sorted = packageTree();
+            int totalClasses = packageTreeTotalClasses;
 
             // Paginate to keep responses below MCP client token limits — a real-world
             // 100k-class APK has 20k+ packages and the un-paginated response was 2 MB+.
@@ -376,7 +371,7 @@ public final class ClassRoutes {
             }
             Map<String, Object> out = new HashMap<>();
             out.put("type", "package-tree");
-            out.put("total_classes", all.size());
+            out.put("total_classes", totalClasses);
             out.put("total_packages", total);
             out.put("offset", from);
             // Mirror `returned` for consistency with Pagination.paginate — avoids
@@ -389,6 +384,29 @@ public final class ClassRoutes {
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Failed to build package tree: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /** Compute (once, cached) the package -> class-count histogram, sorted by count desc. */
+    private List<Map.Entry<String, Integer>> packageTree() {
+        List<Map.Entry<String, Integer>> cached = packageTreeCache;
+        if (cached != null) return cached;
+        synchronized (this) {
+            if (packageTreeCache != null) return packageTreeCache;
+            List<JavaClass> all = context.getClassesWithInners();
+            Map<String, Integer> counts = new HashMap<>();
+            for (JavaClass cls : all) {
+                String full = cls.getFullName();
+                int dot = full.lastIndexOf('.');
+                String pkg = dot > 0 ? full.substring(0, dot) : "(default)";
+                counts.merge(pkg, 1, Integer::sum);
+            }
+            List<Map.Entry<String, Integer>> sorted = counts.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .collect(Collectors.toList());
+            packageTreeTotalClasses = all.size();
+            packageTreeCache = sorted;
+            return sorted;
         }
     }
 
