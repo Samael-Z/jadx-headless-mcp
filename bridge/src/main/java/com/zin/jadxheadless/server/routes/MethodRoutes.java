@@ -62,14 +62,37 @@ public final class MethodRoutes {
             List<Map<String, Object>> overloads = new ArrayList<>();
 
             if (className != null && !className.isEmpty()) {
-                // Fast path: resolve the class in O(1) instead of scanning every class.
+                // Fast path: resolve the class in O(1). Single class -> include decompiled code.
                 JavaClass cls = context.findClassByFqn(className);
                 if (cls != null) {
-                    collectOverloads(cls, methodName, descriptor, overloads);
+                    collectOverloads(cls, methodName, descriptor, overloads, true);
                 }
+            } else if (context.stringIndex().lookupMethodExact(methodName, ctx.queryParam("package")) != null) {
+                // No class_name => DISCOVERY. Return just the LIST OF CLASSES declaring this exact
+                // method name, straight from the index — NO getMethods()/getCodeStr(), which jadx
+                // makes ~1s/class (so iterating candidates for a common name like getDeviceId was 60s).
+                // Caller re-queries with class_name=<one of these> for full overloads + code (O(1)).
+                List<String> classes = context.stringIndex().lookupMethodExact(methodName, ctx.queryParam("package"));
+                int offset = parseInt(ctx, "offset", 0);
+                int count = parseInt(ctx, "count", 0);
+                int total = classes.size();
+                int from = Math.min(Math.max(offset, 0), total);
+                int to = count <= 0 ? total : Math.min(from + count, total);
+                Map<String, Object> out = new HashMap<>();
+                out.put("query", methodName);
+                out.put("classes", new ArrayList<>(classes.subList(from, to)));
+                out.put("count", to - from);
+                out.put("total", total);
+                out.put("offset", from);
+                out.put("has_more", to < total);
+                out.put("index", "ready");
+                out.put("hint", "Classes declaring a method named '" + methodName
+                        + "'. Re-query with class_name=<one of these> for full overloads + code.");
+                ctx.json(out);
+                return;
             } else {
-                // No class given: bounded parallel scan (deadline + cap). buildMethodResult
-                // decompiles each match, so the cap keeps that work bounded too.
+                // No class given AND index not ready: bounded parallel scan (deadline + cap).
+                // buildMethodResult decompiles each match, so the cap keeps that work bounded too.
                 long timeoutMs = parseLong(ctx, "timeout_ms", DEFAULT_SEARCH_TIMEOUT_MS);
                 int cap = parseInt(ctx, "count", DEFAULT_METHOD_MATCH_CAP);
                 long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
@@ -85,7 +108,7 @@ public final class MethodRoutes {
                             if (!m.getName().equals(methodName)) continue;
                             String desc = ClassRoutes.safeDescriptor(m);
                             if (fDesc != null && !fDesc.isEmpty() && !desc.equals(fDesc)) continue;
-                            q.add(buildMethodResult(cls, m, desc));
+                            q.add(buildMethodResult(cls, m, desc, false)); // discovery: no decompile
                             if (cap > 0 && q.size() >= cap) { stop.set(true); }
                         }
                     } catch (Throwable t) {
@@ -126,12 +149,12 @@ public final class MethodRoutes {
     }
 
     private void collectOverloads(JavaClass cls, String methodName, String descriptor,
-                                  List<Map<String, Object>> out) {
+                                  List<Map<String, Object>> out, boolean includeCode) {
         for (JavaMethod m : cls.getMethods()) {
             if (!m.getName().equals(methodName)) continue;
             String desc = ClassRoutes.safeDescriptor(m);
             if (descriptor != null && !descriptor.isEmpty() && !desc.equals(descriptor)) continue;
-            out.add(buildMethodResult(cls, m, desc));
+            out.add(buildMethodResult(cls, m, desc, includeCode));
         }
     }
 
@@ -151,6 +174,33 @@ public final class MethodRoutes {
         int count = parseInt(ctx, "count", parseInt(ctx, "limit", 0));
         int cap = count > 0 ? offset + count : 0;
         try {
+            // Fast path: method-name index. Case-insensitive contains over the distinct
+            // method-name key set (no per-class getMethods() cost -> sub-second vs the
+            // live scan that covered <1% of classes in 25s for a rare name).
+            int capForIndex = count > 0 ? offset + count : 2000;
+            int[] scannedKeys = new int[1];
+            List<String> idx = context.stringIndex().lookupMethodContains(
+                    methodName, ctx.queryParam("package"), capForIndex, scannedKeys);
+            if (idx != null) {
+                int total = idx.size();
+                int from = Math.min(Math.max(offset, 0), total);
+                int to = count <= 0 ? total : Math.min(from + count, total);
+                List<String> page = new ArrayList<>(idx.subList(from, to));
+                Map<String, Object> out = new HashMap<>();
+                out.put("query", methodName);
+                out.put("matches", page);
+                out.put("count", page.size());
+                out.put("offset", from);
+                out.put("total", total);
+                out.put("returned", page.size());
+                out.put("has_more", to < total || total >= capForIndex);
+                out.put("scanned_method_names", scannedKeys[0]);
+                out.put("index", "ready");
+                ctx.json(out);
+                return;
+            }
+
+            // Fallback: bounded live scan (index not ready).
             String term = methodName.toLowerCase();
             long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
             AtomicBoolean stop = new AtomicBoolean(false);
@@ -203,7 +253,7 @@ public final class MethodRoutes {
         }
     }
 
-    private Map<String, Object> buildMethodResult(JavaClass cls, JavaMethod m, String descriptor) {
+    private Map<String, Object> buildMethodResult(JavaClass cls, JavaMethod m, String descriptor, boolean includeCode) {
         Map<String, Object> out = new HashMap<>();
         out.put("class_name", cls.getFullName());
         out.put("method_name", m.getName());
@@ -212,10 +262,14 @@ public final class MethodRoutes {
         out.put("is_constructor", m.isConstructor());
         out.put("descriptor", descriptor);
         out.put("declaration", String.valueOf(m.getCodeNodeRef()));
-        try {
-            out.put("code", m.getCodeStr());
-        } catch (Exception e) {
-            out.put("code", "// Error retrieving code: " + e.getMessage());
+        // Decompiling (getCodeStr) is ~1s/method — skip it for multi-match DISCOVERY (no class_name)
+        // so a common name over hundreds of classes stays fast. Caller re-queries with class_name for code.
+        if (includeCode) {
+            try {
+                out.put("code", m.getCodeStr());
+            } catch (Exception e) {
+                out.put("code", "// Error retrieving code: " + e.getMessage());
+            }
         }
         return out;
     }
