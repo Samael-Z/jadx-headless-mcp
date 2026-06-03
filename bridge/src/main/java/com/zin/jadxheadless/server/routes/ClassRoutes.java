@@ -376,6 +376,7 @@ public final class ClassRoutes {
         int cap = count > 0 ? offset + count : 0;
         boolean regex = "true".equalsIgnoreCase(ctx.queryParam("regex"));
         boolean caseSensitive = "true".equalsIgnoreCase(ctx.queryParam("case_sensitive"));
+        boolean fullScan = "true".equalsIgnoreCase(ctx.queryParam("full_scan"));
 
         // Unified text matcher used by every location: a regex .find() when regex=true,
         // otherwise a (case-sensitive or -insensitive) substring test. This is what makes
@@ -407,6 +408,7 @@ public final class ClassRoutes {
 
             Set<JavaClass> matched = new LinkedHashSet<>();
             boolean timedOut = false;
+            boolean codeScopeMainPkg = false;
             int scanned = 0;
 
             for (SearchLocation loc : locations) {
@@ -423,6 +425,18 @@ public final class ClassRoutes {
                             JavaClass c = context.findClassByFqn(fqn);
                             if (c != null) matched.add(c);
                         }
+                        continue;
+                    }
+                }
+                // CODE: use the code-identifier index (main-package subset) unless full_scan / regex / case-sensitive.
+                if (loc == SearchLocation.CODE && !regex && !caseSensitive && !fullScan) {
+                    List<String> idxHit = context.stringIndex().lookupCodeContains(term, packageFilter, 0, null);
+                    if (idxHit != null) {
+                        for (String fqn : idxHit) {
+                            JavaClass c = context.findClassByFqn(fqn);
+                            if (c != null) matched.add(c);
+                        }
+                        codeScopeMainPkg = true;
                         continue;
                     }
                 }
@@ -455,6 +469,9 @@ public final class ClassRoutes {
             Map<String, Object> out = Pagination.paginate(
                     new ArrayList<>(matched), "class-list", "classes", offset, count, JavaClass::getFullName);
             if (regex) out.put("regex", true);
+            if (codeScopeMainPkg) {
+                out.put("code_scope", "main-package-index — pass full_scan=true for a full-corpus live scan (slower)");
+            }
             if (timedOut) {
                 out.put("timed_out", true);
                 out.put("scanned", scanned);
@@ -945,6 +962,53 @@ public final class ClassRoutes {
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Subclasses lookup failed: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /**
+     * Multi-hop class-level call-graph traversal from {@code class_name}, BFS over the prebuilt
+     * call graph. {@code direction}=callees (default) follows what the class transitively calls;
+     * =callers follows what transitively calls it. Bounded by {@code depth} (hops) and
+     * {@code max_nodes}. Index-backed; requires the call graph to be {@code ready}.
+     */
+    public void handleCallGraph(Context ctx) {
+        String className = requireClassName(ctx);
+        if (className == null) return;
+        String dir = ctx.queryParam("direction");
+        boolean callees = dir == null || !dir.equalsIgnoreCase("callers");
+        int depth = parsePositive(ctx, "depth", 2);
+        if (depth < 1) depth = 1;
+        if (depth > 20) depth = 20;
+        int cap = parsePositive(ctx, "max_nodes", 500);
+        if (cap <= 0) cap = 500;
+        String packageFilter = ctx.queryParam("package");
+        try {
+            List<Map<String, Object>> nodes = context.stringIndex().traverseCallGraph(
+                    className, callees, depth, cap,
+                    isValidPackageFilter(packageFilter) ? packageFilter : null);
+            if (nodes == null) {
+                String st = context.stringIndex().status().name().toLowerCase();
+                Map<String, Object> out = new HashMap<>();
+                out.put("type", "call-graph");
+                out.put("class", className);
+                out.put("index", st);
+                out.put("nodes", new ArrayList<>());
+                out.put("note", "Call-graph index not ready (" + st + "). Retry shortly (poll index_status).");
+                ctx.json(out);
+                return;
+            }
+            nodes.sort((a, b) -> {
+                int d = Integer.compare((Integer) a.get("depth"), (Integer) b.get("depth"));
+                return d != 0 ? d : String.valueOf(a.get("class")).compareTo(String.valueOf(b.get("class")));
+            });
+            Map<String, Object> out = Pagination.paginate(ctx, nodes, "call-graph", "nodes", x -> x);
+            out.put("class", className);
+            out.put("direction", callees ? "callees" : "callers");
+            out.put("max_depth", depth);
+            out.put("index", "ready");
+            ctx.json(out);
+        } catch (Exception e) {
+            Errors.internal(ctx, "Call-graph traversal failed: " + e.getMessage(), e, logger);
         }
     }
 

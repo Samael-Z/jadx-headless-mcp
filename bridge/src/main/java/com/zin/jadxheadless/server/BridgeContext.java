@@ -10,10 +10,18 @@ import jadx.api.data.IJavaNodeRef;
 import jadx.api.data.impl.JadxCodeData;
 import jadx.api.data.impl.JadxCodeRename;
 import jadx.api.data.impl.JadxNodeRef;
+import jadx.api.ResourceFile;
+import jadx.core.utils.android.AndroidManifestParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.xml.sax.InputSource;
 
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.File;
+import java.io.StringReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -44,6 +52,9 @@ public final class BridgeContext {
     private final StringIndex stringIndex = new StringIndex();
     private final RenameStore renameStore = new RenameStore();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+    /** Cap on classes decompiled into the code index (full-corpus decompile is infeasible). */
+    private static final int MAX_CODE_INDEX_CLASSES = 25_000;
 
     /** Cached, lazily computed snapshot of all classes including inner classes. */
     private volatile List<JavaClass> classesWithInners;
@@ -99,17 +110,22 @@ public final class BridgeContext {
             try {
                 Path idxFile = stringIndexFile();
                 if (idxFile != null && stringIndex.load(idxFile)) {
-                    return; // reused persisted index
-                }
-                logger.info("[string-index] building (no valid cache at {})", idxFile);
-                stringIndex.build(getClassesWithInners(), BridgeContext::safeSmali);
-                if (idxFile != null && stringIndex.status() == StringIndex.Status.READY) {
-                    try {
-                        stringIndex.save(idxFile);
-                        logger.info("[string-index] persisted to {}", idxFile);
-                    } catch (Exception e) {
-                        logger.warn("[string-index] persist failed (in-memory index still active): {}", e.toString());
+                    // smali/method/field/type/call indexes reused from disk; still ensure the code index below
+                } else {
+                    logger.info("[string-index] building (no valid cache at {})", idxFile);
+                    stringIndex.build(getClassesWithInners(), BridgeContext::safeSmali);
+                    if (idxFile != null && stringIndex.status() == StringIndex.Status.READY) {
+                        try {
+                            stringIndex.save(idxFile);
+                            logger.info("[string-index] persisted to {}", idxFile);
+                        } catch (Exception e) {
+                            logger.warn("[string-index] persist failed (in-memory index still active): {}", e.toString());
+                        }
                     }
+                }
+                // Code-identifier index (decompile-based, main-package only). Separate file, best-effort.
+                if (stringIndex.status() == StringIndex.Status.READY) {
+                    buildOrLoadCodeIndex();
                 }
             } catch (Throwable t2) {
                 logger.warn("[string-index] background build error: {}", t2.toString());
@@ -131,6 +147,11 @@ public final class BridgeContext {
         return cacheFile(".renames.json");
     }
 
+    /** Persisted code-identifier index location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.codeidx}). */
+    private Path codeIndexFile() {
+        return cacheFile(".codeidx");
+    }
+
     /**
      * Resolve a per-APK cache file under {@code <apk-dir>/.jadx-mcp-cache/} (or the temp dir if the
      * APK's directory is not writable). Keyed by APK name + byte size so a changed APK gets fresh
@@ -147,6 +168,79 @@ public final class BridgeContext {
             }
             return new File(dir, apkFile.getName() + "." + apkFile.length() + suffix).toPath();
         } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Load or build the code-identifier index for the main-package subset (best-effort, separate
+     * .codeidx file). Decompile is expensive, so this is capped at {@link #MAX_CODE_INDEX_CLASSES}
+     * and runs on the same low-priority background thread as the smali index.
+     */
+    private void buildOrLoadCodeIndex() {
+        Path codeFile = codeIndexFile();
+        try {
+            if (codeFile != null && stringIndex.loadCodeIndex(codeFile)) return;
+            String pkg = manifestPackageName();
+            if (pkg == null || pkg.isEmpty()) {
+                logger.info("[code-index] skipped (no manifest package)");
+                return;
+            }
+            List<JavaClass> mainClasses = new ArrayList<>();
+            for (JavaClass c : getClassesWithInners()) {
+                String fqn = c.getFullName();
+                if (fqn.startsWith(pkg + ".") || fqn.equals(pkg)) {
+                    mainClasses.add(c);
+                    if (mainClasses.size() >= MAX_CODE_INDEX_CLASSES) break;
+                }
+            }
+            if (mainClasses.isEmpty()) {
+                logger.info("[code-index] skipped (no classes under package {})", pkg);
+                return;
+            }
+            logger.info("[code-index] building over {} main-package classes (pkg={}, cap={})",
+                    mainClasses.size(), pkg, MAX_CODE_INDEX_CLASSES);
+            stringIndex.buildCodeIndex(mainClasses, c -> {
+                try {
+                    String cached = cache.get(c.getFullName());
+                    if (cached != null) return cached;
+                    String code = c.getCode();
+                    if (code != null) cache.put(c.getFullName(), code);
+                    return code;
+                } catch (Throwable t) {
+                    return null;
+                }
+            });
+            if (codeFile != null && stringIndex.codeIndexReady()) {
+                try {
+                    stringIndex.saveCodeIndex(codeFile);
+                    logger.info("[code-index] persisted to {}", codeFile);
+                } catch (Exception e) {
+                    logger.warn("[code-index] persist failed (in-memory code index still active): {}", e.toString());
+                }
+            }
+        } catch (Throwable t) {
+            logger.warn("[code-index] build error: {}", t.toString());
+        }
+    }
+
+    /** Read the {@code package} attribute from AndroidManifest.xml, or null. */
+    private String manifestPackageName() {
+        try {
+            ResourceFile manifestRes = AndroidManifestParser.getAndroidManifest(jadx.getResources());
+            if (manifestRes == null) return null;
+            String xml = manifestRes.loadContent().getText().getCodeStr();
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setNamespaceAware(false);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            Document doc = builder.parse(new InputSource(new StringReader(xml)));
+            Element root = (Element) doc.getElementsByTagName("manifest").item(0);
+            if (root == null) return null;
+            String pkg = root.getAttribute("package");
+            return pkg == null || pkg.isEmpty() ? null : pkg;
+        } catch (Throwable t) {
+            logger.warn("[code-index] manifest package parse failed: {}", t.toString());
             return null;
         }
     }

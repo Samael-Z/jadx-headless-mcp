@@ -55,7 +55,7 @@ public final class StringIndex {
 
     /** Bump when the on-disk format changes so stale files are ignored. */
     private static final int MAGIC = 0x4A584D31; // "JXM1"
-    private static final int FORMAT_VERSION = 3; // v3 adds field-name + type-hierarchy indexes
+    private static final int FORMAT_VERSION = 4; // v4 adds the class-level call graph (forward + reverse)
 
     public enum Status { ABSENT, BUILDING, READY, FAILED }
 
@@ -73,6 +73,21 @@ public final class StringIndex {
     private volatile Map<String, int[]> fieldPostings;
     /** supertype/interface FQN -> sorted class ids of its DIRECT subclasses/implementors. */
     private volatile Map<String, int[]> typeHierarchy;
+    /** callee-space FQNs: invoke-target owner classes (may include framework/library classes not in idToFqn). */
+    private volatile String[] calleeNames;
+    /** caller class id (into idToFqn) -> sorted callee ids (into calleeNames). The forward call graph. */
+    private volatile int[][] forwardCalls;
+    /** callee id (into calleeNames) -> sorted caller class ids (into idToFqn). The reverse call graph. */
+    private volatile int[][] reverseCalls;
+    /** code identifier token -> sorted ids into {@link #codeIdToFqn}. Built from decompiled source of a LIMITED
+     *  main-package subset (full-corpus decompile is infeasible). Persisted in a separate {@code .codeidx} file. */
+    private volatile Map<String, int[]> codeTokens;
+    /** FQNs of the classes actually decompiled into {@link #codeTokens} (the main-package subset). */
+    private volatile String[] codeIdToFqn;
+    private volatile int codeIndexedClasses = 0;
+    /** Lazy FQN -> id reverse maps for call-graph queries (built on first use). */
+    private volatile Map<String, Integer> fqnToId;
+    private volatile Map<String, Integer> calleeFqnToId;
     private volatile String[] idToFqn;
 
     public Status status() { return status; }
@@ -86,6 +101,9 @@ public final class StringIndex {
         m.put("distinct_methods", methodPostings == null ? 0 : methodPostings.size());
         m.put("distinct_fields", fieldPostings == null ? 0 : fieldPostings.size());
         m.put("distinct_supertypes", typeHierarchy == null ? 0 : typeHierarchy.size());
+        m.put("callee_classes", calleeNames == null ? 0 : calleeNames.length);
+        m.put("code_indexed_classes", codeIndexedClasses);
+        m.put("code_tokens", codeTokens == null ? 0 : codeTokens.size());
         m.put("build_ms", buildMillis);
         if (!detail.isEmpty()) m.put("detail", detail);
         return m;
@@ -134,6 +152,11 @@ public final class StringIndex {
             final ConcurrentHashMap<String, IntBag> tmpM = new ConcurrentHashMap<>(1 << 19);
             final ConcurrentHashMap<String, IntBag> tmpF = new ConcurrentHashMap<>(1 << 19);
             final ConcurrentHashMap<String, IntBag> tmpH = new ConcurrentHashMap<>(1 << 16);
+            // Forward call graph: each caller task fills its own array slot (no cross-thread
+            // contention); callee FQNs are interned into a shared id space (calleeIdMap).
+            final IntBag[] forwardBags = new IntBag[classes.size()];
+            final ConcurrentHashMap<String, Integer> calleeIdMap = new ConcurrentHashMap<>(1 << 19);
+            final AtomicInteger calleeSeq = new AtomicInteger();
             IntStream.range(0, classes.size()).parallel().forEach(i -> {
                 try {
                     JavaClass c = classes.get(i);
@@ -149,6 +172,10 @@ public final class StringIndex {
                                 tmpF.computeIfAbsent(name, k -> new IntBag()).add(id));
                         extractSuperTypes(smali, sup ->
                                 tmpH.computeIfAbsent(sup, k -> new IntBag()).add(id));
+                        IntBag fb = new IntBag();
+                        extractInvokeOwners(smali, owner ->
+                                fb.add(calleeIdMap.computeIfAbsent(owner, k -> calleeSeq.getAndIncrement())));
+                        forwardBags[i] = fb;
                     }
                 } catch (Throwable t) {
                     // One bad/huge class must not fail the whole build.
@@ -163,15 +190,45 @@ public final class StringIndex {
             Map<String, int[]> frozenM = freeze(tmpM);
             Map<String, int[]> frozenF = freeze(tmpF);
             Map<String, int[]> frozenH = freeze(tmpH);
+            // Freeze the forward graph + intern callee names, then derive the reverse graph (serial,
+            // O(edges)). A single shared EMPTY avoids allocating one empty array per call-less class.
+            final int[] EMPTY = new int[0];
+            int[][] fwd = new int[classes.size()][];
+            for (int i = 0; i < fwd.length; i++) {
+                fwd[i] = forwardBags[i] == null ? EMPTY : forwardBags[i].toSortedUnique();
+            }
+            int calleeCount = calleeSeq.get();
+            String[] calleeArr = new String[calleeCount];
+            calleeIdMap.forEach((fqn, cid) -> { if (cid != null && cid >= 0 && cid < calleeCount) calleeArr[cid] = fqn; });
+            IntBag[] revBags = new IntBag[calleeCount];
+            long edgeCount = 0;
+            for (int i = 0; i < fwd.length; i++) {
+                for (int cid : fwd[i]) {
+                    if (cid < 0 || cid >= calleeCount) continue;
+                    edgeCount++;
+                    IntBag rb = revBags[cid];
+                    if (rb == null) { rb = new IntBag(); revBags[cid] = rb; }
+                    rb.add(i);
+                }
+            }
+            int[][] rev = new int[calleeCount][];
+            for (int cid = 0; cid < calleeCount; cid++) {
+                rev[cid] = revBags[cid] == null ? EMPTY : revBags[cid].toSortedUnique();
+            }
             this.idToFqn = fqns;
             this.postings = frozen;
             this.methodPostings = frozenM;
             this.fieldPostings = frozenF;
             this.typeHierarchy = frozenH;
+            this.calleeNames = calleeArr;
+            this.forwardCalls = fwd;
+            this.reverseCalls = rev;
+            this.fqnToId = null;
+            this.calleeFqnToId = null;
             this.buildMillis = System.currentTimeMillis() - t0;
             status = Status.READY;
-            logger.info("[string-index] READY: {} strings / {} methods / {} fields / {} supertypes over {} classes in {}ms",
-                    frozen.size(), frozenM.size(), frozenF.size(), frozenH.size(), classes.size(), buildMillis);
+            logger.info("[string-index] READY: {} strings / {} methods / {} fields / {} supertypes / {} callees / {} call-edges over {} classes in {}ms",
+                    frozen.size(), frozenM.size(), frozenF.size(), frozenH.size(), calleeCount, edgeCount, classes.size(), buildMillis);
         } catch (Throwable t) {
             detail = String.valueOf(t);
             status = Status.FAILED;
@@ -362,6 +419,186 @@ public final class StringIndex {
         return idsToFqns(th.get(supertypeFqn), packageFilter);
     }
 
+    // -------------------- call graph --------------------
+
+    /** Lazily build the FQN -> id reverse maps used by call-graph queries. */
+    private void ensureCallMaps() {
+        if (fqnToId != null && calleeFqnToId != null) return;
+        synchronized (this) {
+            if (fqnToId == null) {
+                String[] f = idToFqn;
+                Map<String, Integer> m = new java.util.HashMap<>(f == null ? 16 : f.length * 2);
+                if (f != null) for (int i = 0; i < f.length; i++) if (f[i] != null) m.putIfAbsent(f[i], i);
+                fqnToId = m;
+            }
+            if (calleeFqnToId == null) {
+                String[] cn = calleeNames;
+                Map<String, Integer> m = new java.util.HashMap<>(cn == null ? 16 : cn.length * 2);
+                if (cn != null) for (int i = 0; i < cn.length; i++) if (cn[i] != null) m.putIfAbsent(cn[i], i);
+                calleeFqnToId = m;
+            }
+        }
+    }
+
+    /** Direct callees (class level) of {@code classFqn}; null if the call graph isn't READY. */
+    public List<String> directCallees(String classFqn, String packageFilter) {
+        if (status != Status.READY || forwardCalls == null || calleeNames == null) return null;
+        ensureCallMaps();
+        Integer id = fqnToId.get(classFqn);
+        if (id == null || id < 0 || id >= forwardCalls.length) return Collections.emptyList();
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        List<String> out = new ArrayList<>();
+        for (int cid : forwardCalls[id]) {
+            if (cid < 0 || cid >= calleeNames.length) continue;
+            String fqn = calleeNames[cid];
+            if (fqn != null && (!filt || fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter))) out.add(fqn);
+        }
+        return out;
+    }
+
+    /** Direct callers (class level) of {@code classFqn}; null if the call graph isn't READY. */
+    public List<String> directCallers(String classFqn, String packageFilter) {
+        if (status != Status.READY || reverseCalls == null || idToFqn == null) return null;
+        ensureCallMaps();
+        Integer cid = calleeFqnToId.get(classFqn);
+        if (cid == null || cid < 0 || cid >= reverseCalls.length) return Collections.emptyList();
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        List<String> out = new ArrayList<>();
+        for (int id : reverseCalls[cid]) {
+            if (id < 0 || id >= idToFqn.length) continue;
+            String fqn = idToFqn[id];
+            if (fqn != null && (!filt || fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter))) out.add(fqn);
+        }
+        return out;
+    }
+
+    /**
+     * BFS over the call graph from {@code startFqn} up to {@code maxDepth} hops, capping visited
+     * nodes at {@code cap}. {@code callees=true} follows forward edges (what this class transitively
+     * calls), false follows reverse edges (what transitively calls it). Each reached node is returned
+     * with its shortest depth (the start node is excluded). Null if the graph isn't READY.
+     */
+    public List<Map<String, Object>> traverseCallGraph(String startFqn, boolean callees,
+                                                        int maxDepth, int cap, String packageFilter) {
+        if (status != Status.READY || forwardCalls == null || reverseCalls == null) return null;
+        ensureCallMaps();
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        java.util.LinkedHashMap<String, Integer> seen = new java.util.LinkedHashMap<>();
+        java.util.ArrayDeque<String> frontier = new java.util.ArrayDeque<>();
+        seen.put(startFqn, 0);
+        frontier.add(startFqn);
+        int depth = 0;
+        while (!frontier.isEmpty() && depth < maxDepth) {
+            depth++;
+            int sz = frontier.size();
+            for (int s = 0; s < sz && !frontier.isEmpty(); s++) {
+                String cur = frontier.poll();
+                List<String> next = callees ? directCallees(cur, null) : directCallers(cur, null);
+                if (next == null) continue;
+                for (String nb : next) {
+                    if (seen.containsKey(nb)) continue;
+                    seen.put(nb, depth);
+                    frontier.add(nb);
+                    if (seen.size() >= cap) { frontier.clear(); break; }
+                }
+            }
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map.Entry<String, Integer> e : seen.entrySet()) {
+            if (e.getValue() == 0) continue; // exclude the start node
+            String fqn = e.getKey();
+            if (filt && !(fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter))) continue;
+            Map<String, Object> row = new HashMap<>();
+            row.put("class", fqn);
+            row.put("depth", e.getValue());
+            out.add(row);
+        }
+        return out;
+    }
+
+    // -------------------- code identifier index (limited main-package subset) --------------------
+
+    /**
+     * Build the code-identifier index from a LIMITED set of classes (the caller passes a
+     * main-package subset — full-corpus decompile is infeasible). Decompiles each via {@code codeFn}
+     * and inverts its Java identifiers (length &gt;= 3) -&gt; classes. Self-contained id space
+     * ({@link #codeIdToFqn}); persisted separately via {@link #saveCodeIndex}.
+     */
+    public synchronized void buildCodeIndex(List<JavaClass> classes,
+                                            java.util.function.Function<JavaClass, String> codeFn) {
+        final String[] fqns = new String[classes.size()];
+        final ConcurrentHashMap<String, IntBag> tmp = new ConcurrentHashMap<>(1 << 19);
+        IntStream.range(0, classes.size()).parallel().forEach(i -> {
+            try {
+                JavaClass c = classes.get(i);
+                fqns[i] = c.getFullName();
+                String code = codeFn.apply(c);
+                if (code != null && !code.isEmpty()) {
+                    final int id = i;
+                    extractIdentifiers(code, tok -> tmp.computeIfAbsent(tok, k -> new IntBag()).add(id));
+                }
+            } catch (Throwable t) {
+                if (fqns[i] == null) fqns[i] = "?";
+            }
+        });
+        this.codeIdToFqn = fqns;
+        this.codeTokens = freeze(tmp);
+        this.codeIndexedClasses = classes.size();
+        logger.info("[code-index] READY: {} tokens over {} main-package classes",
+                codeTokens.size(), classes.size());
+    }
+
+    public boolean codeIndexReady() {
+        return codeTokens != null && codeIdToFqn != null;
+    }
+
+    /**
+     * Classes (within the code-indexed subset) whose decompiled source contains an identifier token
+     * matching {@code term} (case-insensitive substring), up to {@code cap}. Null if the code index
+     * isn't built. Identifier-level: won't match across token boundaries / punctuation — callers use
+     * the live code scan for those (or a full scan).
+     */
+    public List<String> lookupCodeContains(String term, String packageFilter, int cap, int[] outScannedKeys) {
+        Map<String, int[]> ct = codeTokens;
+        String[] f = codeIdToFqn;
+        if (ct == null || f == null) return null;
+        String t = term.toLowerCase();
+        boolean filt = packageFilter != null && !packageFilter.isEmpty();
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        int keys = 0;
+        for (Map.Entry<String, int[]> e : ct.entrySet()) {
+            keys++;
+            if (!e.getKey().toLowerCase().contains(t)) continue;
+            for (int id : e.getValue()) {
+                if (id < 0 || id >= f.length) continue;
+                String fqn = f[id];
+                if (fqn != null && (!filt || fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter))) {
+                    out.add(fqn);
+                    if (cap > 0 && out.size() >= cap) { if (outScannedKeys != null) outScannedKeys[0] = keys; return new ArrayList<>(out); }
+                }
+            }
+        }
+        if (outScannedKeys != null) outScannedKeys[0] = keys;
+        return new ArrayList<>(out);
+    }
+
+    /** Extract Java identifier tokens (length &gt;= 3) from decompiled code; the caller's IntBag de-dups. */
+    private static void extractIdentifiers(String code, java.util.function.Consumer<String> sink) {
+        int n = code.length();
+        int i = 0;
+        while (i < n) {
+            char c = code.charAt(i);
+            if (Character.isJavaIdentifierStart(c)) {
+                int s = i;
+                i++;
+                while (i < n && Character.isJavaIdentifierPart(code.charAt(i))) i++;
+                if (i - s >= 3) sink.accept(code.substring(s, i));
+            } else {
+                i++;
+            }
+        }
+    }
+
     /**
      * Extract every method name declared in a class's smali ({@code .method <mods> name(...)...}),
      * including {@code <init>}/{@code <clinit>}. Hand-written scan (no regex), one line per method.
@@ -441,6 +678,30 @@ public final class StringIndex {
     }
 
     /**
+     * Extract the owner FQN of every {@code invoke-*} target in a class's smali (the
+     * {@code , L<owner>;-><name>(...)} tail), as a dotted FQN. Emits one entry per invoke; the
+     * caller de-dups via its IntBag. Mirrors XrefsRoutes' on-demand parse, but for the whole class.
+     */
+    private static void extractInvokeOwners(String smali, java.util.function.Consumer<String> sink) {
+        int from = 0;
+        int len = smali.length();
+        while (true) {
+            int idx = smali.indexOf("invoke", from);
+            if (idx < 0) break;
+            int lineEnd = smali.indexOf('\n', idx);
+            if (lineEnd < 0) lineEnd = len;
+            int owner = smali.indexOf(", L", idx);
+            if (owner > 0 && owner < lineEnd) {
+                int arrow = smali.indexOf(";->", owner);
+                if (arrow > 0 && arrow < lineEnd) {
+                    sink.accept(smali.substring(owner + 3, arrow).replace('/', '.'));
+                }
+            }
+            from = lineEnd + 1;
+        }
+    }
+
+    /**
      * Extract every {@code const-string}/{@code const-string/jumbo} operand from a class's
      * smali, feeding the escaped operand text (as it appears between the quotes) to {@code sink}.
      *
@@ -493,8 +754,12 @@ public final class StringIndex {
         Map<String, int[]> pm = methodPostings;
         Map<String, int[]> pf = fieldPostings;
         Map<String, int[]> ph = typeHierarchy;
+        String[] cn = calleeNames;
+        int[][] fwd = forwardCalls;
+        int[][] rev = reverseCalls;
         String[] f = idToFqn;
-        if (p == null || pm == null || pf == null || ph == null || f == null) throw new IOException("index not built");
+        if (p == null || pm == null || pf == null || ph == null || f == null
+                || cn == null || fwd == null || rev == null) throw new IOException("index not built");
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
         Files.createDirectories(file.getParent());
         try (OutputStream fos = Files.newOutputStream(tmp);
@@ -509,6 +774,10 @@ public final class StringIndex {
             writePostings(out, pm);
             writePostings(out, pf);
             writePostings(out, ph);
+            out.writeInt(cn.length);
+            for (String s : cn) writeStr(out, s == null ? "" : s);
+            writeGraph(out, fwd);
+            writeGraph(out, rev);
         }
         Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
@@ -538,6 +807,29 @@ public final class StringIndex {
         return p;
     }
 
+    /** Write an int[][] adjacency graph: row count, then per row (len, ints). */
+    private static void writeGraph(DataOutputStream out, int[][] g) throws IOException {
+        out.writeInt(g.length);
+        for (int[] row : g) {
+            out.writeInt(row.length);
+            for (int v : row) out.writeInt(v);
+        }
+    }
+
+    private static int[][] readGraph(DataInputStream in, int maxRow) throws IOException {
+        int n = in.readInt();
+        if (n < 0 || n > 60_000_000) throw new IOException("bad graph size " + n);
+        int[][] g = new int[n][];
+        for (int i = 0; i < n; i++) {
+            int len = in.readInt();
+            if (len < 0 || len > maxRow) throw new IOException("bad graph row " + len);
+            int[] row = new int[len];
+            for (int j = 0; j < len; j++) row[j] = in.readInt();
+            g[i] = row;
+        }
+        return g;
+    }
+
     /** Load from a file written by {@link #save}. Returns false (and leaves status ABSENT) on any mismatch. */
     public boolean load(Path file) {
         if (!Files.isReadable(file)) return false;
@@ -553,19 +845,78 @@ public final class StringIndex {
             Map<String, int[]> pm = readPostings(in, n);
             Map<String, int[]> pf = readPostings(in, n);
             Map<String, int[]> ph = readPostings(in, n);
+            int cnLen = in.readInt();
+            if (cnLen < 0 || cnLen > 60_000_000) return false;
+            String[] cn = new String[cnLen];
+            for (int i = 0; i < cnLen; i++) cn[i] = readStr(in);
+            int[][] fwd = readGraph(in, cnLen); // forward rows index calleeNames
+            int[][] rev = readGraph(in, n);     // reverse rows index idToFqn
             this.idToFqn = f;
             this.postings = p;
             this.methodPostings = pm;
             this.fieldPostings = pf;
             this.typeHierarchy = ph;
+            this.calleeNames = cn;
+            this.forwardCalls = fwd;
+            this.reverseCalls = rev;
+            this.fqnToId = null;
+            this.calleeFqnToId = null;
             this.totalClasses = n;
             this.builtClasses.set(n);
             this.status = Status.READY;
-            logger.info("[string-index] loaded {} strings / {} methods / {} fields / {} supertypes / {} classes from {}",
-                    p.size(), pm.size(), pf.size(), ph.size(), n, file.getFileName());
+            logger.info("[string-index] loaded {} strings / {} methods / {} fields / {} supertypes / {} callees / {} classes from {}",
+                    p.size(), pm.size(), pf.size(), ph.size(), cn.length, n, file.getFileName());
             return true;
         } catch (Throwable t) {
             logger.warn("[string-index] load failed ({}), will rebuild", t.toString());
+            return false;
+        }
+    }
+
+    /** Separate on-disk format for the code-identifier index (kept out of the main .stridx). */
+    private static final int CODE_MAGIC = 0x4A584D43; // "JXMC"
+    private static final int CODE_FORMAT_VERSION = 1;
+
+    /** Serialize the code index to its own Deflate-compressed file. */
+    public void saveCodeIndex(Path file) throws IOException {
+        Map<String, int[]> ct = codeTokens;
+        String[] f = codeIdToFqn;
+        if (ct == null || f == null) throw new IOException("code index not built");
+        Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+        if (file.getParent() != null) Files.createDirectories(file.getParent());
+        try (OutputStream fos = Files.newOutputStream(tmp);
+             DeflaterOutputStream def = new DeflaterOutputStream(new BufferedOutputStream(fos),
+                     new Deflater(Deflater.BEST_SPEED));
+             DataOutputStream out = new DataOutputStream(def)) {
+            out.writeInt(CODE_MAGIC);
+            out.writeInt(CODE_FORMAT_VERSION);
+            out.writeInt(f.length);
+            for (String fqn : f) writeStr(out, fqn == null ? "" : fqn);
+            writePostings(out, ct);
+        }
+        Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** Load a code index written by {@link #saveCodeIndex}. Returns false on absence/mismatch. */
+    public boolean loadCodeIndex(Path file) {
+        if (!Files.isReadable(file)) return false;
+        try (InputStream fis = Files.newInputStream(file);
+             InflaterInputStream inf = new InflaterInputStream(new BufferedInputStream(fis));
+             DataInputStream in = new DataInputStream(inf)) {
+            if (in.readInt() != CODE_MAGIC || in.readInt() != CODE_FORMAT_VERSION) return false;
+            int n = in.readInt();
+            if (n < 0 || n > 5_000_000) return false;
+            String[] f = new String[n];
+            for (int i = 0; i < n; i++) f[i] = readStr(in);
+            Map<String, int[]> ct = readPostings(in, n);
+            this.codeIdToFqn = f;
+            this.codeTokens = ct;
+            this.codeIndexedClasses = n;
+            logger.info("[code-index] loaded {} tokens / {} main-package classes from {}",
+                    ct.size(), n, file.getFileName());
+            return true;
+        } catch (Throwable t) {
+            logger.warn("[code-index] load failed ({}), will rebuild", t.toString());
             return false;
         }
     }

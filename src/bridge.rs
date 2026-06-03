@@ -213,6 +213,15 @@ impl Bridge {
         self.client.clone()
     }
 
+    /// True if the child JVM has exited (e.g. OOM-killed mid-run). Best-effort, non-blocking.
+    pub async fn is_dead(&self) -> bool {
+        let mut guard = self.child.lock().await;
+        match guard.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
     pub async fn shutdown(&self) {
         // Drop the stdin write-end first: this trips the bridge's stdin-EOF
         // watchdog as a belt-and-suspenders companion to the explicit kill below.

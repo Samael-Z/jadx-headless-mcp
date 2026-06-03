@@ -76,6 +76,10 @@ pub struct SearchClassesReq {
     /// Match case-sensitively. Default false (case-insensitive), matching non-regex behavior.
     #[serde(default)]
     pub case_sensitive: Option<bool>,
+    /// For search_in=code: bypass the (main-package) code index and do a full-corpus live scan
+    /// (slower, but also covers library classes). Default false.
+    #[serde(default)]
+    pub full_scan: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -244,6 +248,28 @@ pub struct SubclassesReq {
     /// Fully-qualified class or interface name. Returns its DIRECT subclasses / implementors.
     pub class_name: String,
     /// Optional package prefix filter on the results.
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CallGraphReq {
+    /// Fully-qualified class to start the traversal from.
+    pub class_name: String,
+    /// "callees" (default — what this class transitively calls) or "callers" (what calls it).
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Max hops to traverse (default 2, capped at 20).
+    #[serde(default)]
+    pub depth: Option<u32>,
+    /// Cap on total nodes visited (default 500).
+    #[serde(default)]
+    pub max_nodes: Option<u32>,
+    /// Optional package prefix filter on returned nodes.
     #[serde(default)]
     pub package: Option<String>,
     #[serde(default)]

@@ -150,7 +150,7 @@ jadx-mcp --jvm-arg=-Xmx4g
 
 ## 暴露的工具
 
-六大类共 33 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
+六大类共 34 个工具。在客户端里运行 `tools/list` 可以看到完整 schema —— 下表只列了简介。
 
 | 类别 | 工具 |
 |---|---|
@@ -158,7 +158,7 @@ jadx-mcp --jvm-arg=-Xmx4g
 | **类相关** | `get_all_classes`、`get_class_source`、`get_class_sources`（批量）、`get_methods_of_class`、`get_fields_of_class`、`get_smali_of_class`、`get_main_activity_class`、`get_main_application_classes_names`、`get_main_application_classes_code`、`get_package_tree`、`search_classes_by_keyword`（子串或 `regex=true`）、`search_string_constants`、`get_cache_stats`、`clear_cache`、`index_status`、`get_subclasses` |
 | **方法相关** | `get_method_by_name`、`search_method_by_name` |
 | **资源相关** | `get_android_manifest`、`get_strings`、`get_all_resource_file_names`、`get_resource_file` |
-| **交叉引用** | `get_xrefs_to_class`、`get_xrefs_to_method`、`get_xrefs_to_field`、`get_xrefs_from_method`、`get_xrefs_from_class` |
+| **交叉引用** | `get_xrefs_to_class`、`get_xrefs_to_method`、`get_xrefs_to_field`、`get_xrefs_from_method`、`get_xrefs_from_class`、`get_call_graph` |
 | **重命名** | `rename_class`、`rename_method`、`rename_field`、`rename_package` |
 
 典型分析流程：

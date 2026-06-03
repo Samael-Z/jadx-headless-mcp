@@ -148,9 +148,21 @@ jadx-mcp --jvm-arg=-Xmx4g
 
 The 2 GB default is a **baseline**: passing your own `-Xmx` overrides the heap, while other flags are additive — e.g. `JADX_MCP_JVM_ARGS="-Xmx4g -Xss2m"` keeps a 4 GB heap and adds a 2 MB thread stack. Multiple flags are space-separated.
 
+#### Large APKs need more heap
+
+The JADX model scales with class count, and the persisted indexes (string / method / field / type-hierarchy / call-graph, plus an optional main-package code index) are built once in a background pass. Rough **first-build** guidance:
+
+| APK (decompiled classes) | suggested `-Xmx` |
+|---|---|
+| small (< 50k) | default `-Xmx2g` is fine |
+| medium (~100k) | `-Xmx6g` |
+| large (300k–500k, e.g. ByteDance / Tencent apps) | `-Xmx12g`–`16g` for the **first** build |
+
+The heavy cost is the one-time first build; once the `.stridx` / `.codeidx` files are written next to the APK (`<apk-dir>/.jadx-mcp-cache/`), later runs reload them in seconds at a much smaller heap. If a big APK's first build runs out of memory the bridge JVM is killed (you'll get a clear "bridge exited" error on the next tool call) — give it more `-Xmx` and call `load_apk` again. The code-identifier index is intentionally limited to the app's main package; full-corpus decompile of a 500k-class APK is infeasible.
+
 ## Tools exposed
 
-Thirty-three tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
+Thirty-four tools across six categories. Run `tools/list` from your client for the full schema — descriptions below are abbreviated.
 
 | Category | Tool |
 |---|---|
@@ -158,7 +170,7 @@ Thirty-three tools across six categories. Run `tools/list` from your client for 
 | **Classes** | `get_all_classes`, `get_class_source`, `get_class_sources` (batch), `get_methods_of_class`, `get_fields_of_class`, `get_smali_of_class`, `get_main_activity_class`, `get_main_application_classes_names`, `get_main_application_classes_code`, `get_package_tree`, `search_classes_by_keyword` (substring or `regex=true`), `search_string_constants`, `get_cache_stats`, `clear_cache`, `index_status`, `get_subclasses` |
 | **Methods** | `get_method_by_name`, `search_method_by_name` |
 | **Resources** | `get_android_manifest`, `get_strings`, `get_all_resource_file_names`, `get_resource_file` |
-| **Xrefs** | `get_xrefs_to_class`, `get_xrefs_to_method`, `get_xrefs_to_field`, `get_xrefs_from_method`, `get_xrefs_from_class` |
+| **Xrefs** | `get_xrefs_to_class`, `get_xrefs_to_method`, `get_xrefs_to_field`, `get_xrefs_from_method`, `get_xrefs_from_class`, `get_call_graph` |
 | **Renames** | `rename_class`, `rename_method`, `rename_field`, `rename_package` |
 
 A typical analysis flow:

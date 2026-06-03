@@ -143,7 +143,7 @@ impl JadxMcpServer {
             // into a Value and re-serializing. On multi-MB class-source / smali / manifest
             // payloads that round-trip of (de)serialization is pure overhead.
             Ok(body) => CallToolResult::success(vec![Content::text(body)]),
-            Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
+            Err(e) => self.bridge_error(e).await,
         }
     }
 
@@ -154,8 +154,31 @@ impl JadxMcpServer {
         };
         match client.post_raw(path, query).await {
             Ok(body) => CallToolResult::success(vec![Content::text(body)]),
-            Err(e) => ToolError::Bridge(format!("{e:#}")).to_tool_result(),
+            Err(e) => self.bridge_error(e).await,
         }
+    }
+
+    /// Turn a bridge HTTP failure into a tool error, upgrading to a clear "bridge exited" message
+    /// (with a heap hint) when the child JVM has actually died — e.g. OOM-killed while loading or
+    /// indexing a large APK — instead of a bare connection error.
+    async fn bridge_error(&self, e: anyhow::Error) -> CallToolResult {
+        let dead = {
+            let guard = self.state.read().await;
+            match guard.bridge.as_ref() {
+                Some(b) => b.is_dead().await,
+                None => true,
+            }
+        };
+        if dead {
+            return ToolError::Bridge(
+                "the jadx-bridge JVM has exited — most likely out of memory while loading or \
+                 indexing a large APK. Increase the heap (e.g. JADX_MCP_JVM_ARGS=-Xmx12g) and \
+                 call load_apk again."
+                    .to_string(),
+            )
+            .to_tool_result();
+        }
+        ToolError::Bridge(format!("{e:#}")).to_tool_result()
     }
 }
 
@@ -345,7 +368,8 @@ impl JadxMcpServer {
                           Set `regex=true` to treat the term as a Java regex (matched with .find(); applies \
                           to every selected scope), `case_sensitive=true` for exact case. class/method/field \
                           name scans are fast; code/comment scans decompile every class and are time-bounded \
-                          (see `timeout_ms`).")]
+                          (see `timeout_ms`). When the code index is ready, search_in=code is served from it \
+                          (main-package scope, sub-second); pass full_scan=true for a full-corpus live scan.")]
     async fn search_classes_by_keyword(
         &self,
         Parameters(req): Parameters<SearchClassesReq>,
@@ -365,6 +389,9 @@ impl JadxMcpServer {
         }
         if let Some(b) = req.case_sensitive {
             q.push(("case_sensitive", b.to_string()));
+        }
+        if let Some(b) = req.full_scan {
+            q.push(("full_scan", b.to_string()));
         }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/search-classes-by-keyword", &q).await)
@@ -448,6 +475,33 @@ impl JadxMcpServer {
         }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/subclasses", &q).await)
+    }
+
+    #[tool(description = "Traverse the class-level CALL GRAPH from a class, multi-hop. direction=callees \
+                          (default) follows what the class transitively CALLS; direction=callers follows what \
+                          transitively calls IT. Each node is {class, depth}. This is the multi-hop counterpart \
+                          to get_xrefs_from_* (which give single-hop method-level detail). Ideal for tracing a \
+                          protocol / crypto / signing path across classes. depth default 2 (max 20); \
+                          max_nodes default 500. Index-backed (poll index_status).")]
+    async fn get_call_graph(
+        &self,
+        Parameters(req): Parameters<CallGraphReq>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q: Vec<(&'static str, String)> = vec![("class_name", req.class_name)];
+        if let Some(d) = req.direction {
+            q.push(("direction", d));
+        }
+        if let Some(d) = req.depth {
+            q.push(("depth", d.to_string()));
+        }
+        if let Some(m) = req.max_nodes {
+            q.push(("max_nodes", m.to_string()));
+        }
+        if let Some(p) = req.package {
+            q.push(("package", p));
+        }
+        q.extend(pagination_qs(&req.offset, &req.count));
+        Ok(self.get("/call-graph", &q).await)
     }
 
     #[tool(description = "Decompilation source cache statistics: hits, misses, hit_rate, cached_classes, compressed_mb.")]
