@@ -61,11 +61,11 @@ pub struct SearchClassesReq {
     pub offset: Option<u32>,
     #[serde(default)]
     pub count: Option<u32>,
-    /// Wall-clock budget in milliseconds for code/comment scans (default 25000).
-    /// class/method/field name matching is fast and unaffected; code/comment
-    /// decompile every class, so on a huge APK they stop at this budget and
-    /// return partial results with `timed_out: true`. Prefer `search_in=class`
-    /// (fast) when you can; raise this only for exhaustive code sweeps.
+    /// Wall-clock budget in milliseconds (default 25000) for the scan-backed paths. While the
+    /// pre-decompiled Java index is still warming up (poll `index_status`), code/comment search
+    /// falls back to a bounded live decompile scan that stops at this budget and returns partial
+    /// results with `timed_out: true`. Once the index is warm, code search is sub-second. Prefer
+    /// `search_in=class` (fast) when you can; raise this only for exhaustive code sweeps.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Treat `search_term` as a Java regular expression (matched with `.find()`), applied to
@@ -76,26 +76,20 @@ pub struct SearchClassesReq {
     /// Match case-sensitively. Default false (case-insensitive), matching non-regex behavior.
     #[serde(default)]
     pub case_sensitive: Option<bool>,
-    /// For search_in=code: bypass the (main-package) code index and do a full-corpus live scan
-    /// (slower, but also covers library classes). Default false.
-    #[serde(default)]
-    pub full_scan: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindStringUsagesReq {
-    /// The string literal to search for. By default this is matched against
-    /// the smali const-string opcodes of every class (authoritative; works
-    /// even for classes jadx cannot decompile).
+    /// The string literal to search for. Matched via a bounded live scan (no global index):
+    /// against decompiled Java source and/or each class's smali const-string opcodes (see `source`).
     pub literal: String,
     /// Which source(s) to search:
-    /// - "smali" (default): scans `const-string vN, "<literal>"` opcodes.
-    ///   Works on R8/anti-tamper hardened classes whose decompile is empty.
-    /// - "code": scans jadx-decompiled Java/Kotlin source (faster on big
-    ///   APKs because decompile is cached, but returns 0 hits on hardened
-    ///   classes).
-    /// - "both": report classes matched by either source. `matched_in`
-    ///   in the response tells you which.
+    /// - "code": scans jadx-decompiled Java/Kotlin source (cached, fast on repeat, but returns 0
+    ///   hits on hardened classes jadx can't decompile).
+    /// - "smali": scans each class's `const-string vN, "<literal>"` opcodes. Works on
+    ///   R8/anti-tamper hardened classes whose decompile is empty.
+    /// - "both" (default): report classes matched by either source. `matched_in` in the response
+    ///   tells you which.
     #[serde(default)]
     pub source: Option<String>,
     /// Code-path only. If false, match the raw substring instead of the
@@ -203,7 +197,7 @@ pub struct ClassSourcesReq {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchStringConstantsReq {
-    /// Substring (default) or regex to match against DEX string-constant VALUES.
+    /// Substring (default) or regex to match against string-literal VALUES in decompiled Java source.
     pub query: String,
     /// Treat `query` as a Java regular expression (matched with `.find()`). Default false.
     #[serde(default)]
@@ -214,6 +208,11 @@ pub struct SearchStringConstantsReq {
     /// Optional package prefix filter (e.g. "com.example.app").
     #[serde(default)]
     pub package: Option<String>,
+    /// Wall-clock budget in milliseconds for the scan (default 25000). While the pre-decompiled Java
+    /// index is still warming up, this runs as a bounded live scan and may return partial results
+    /// with `timed_out: true`; once warm it is sub-second.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub offset: Option<u32>,
     #[serde(default)]
@@ -245,7 +244,8 @@ pub struct XrefsFromClassReq {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubclassesReq {
-    /// Fully-qualified class or interface name. Returns its DIRECT subclasses / implementors.
+    /// Fully-qualified class or interface name (as shown in decompiled source). Returns its DIRECT
+    /// subclasses / implementors, enumerated live from the jadx type-hierarchy model (no index).
     pub class_name: String,
     /// Optional package prefix filter on the results.
     #[serde(default)]
@@ -258,7 +258,7 @@ pub struct SubclassesReq {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CallGraphReq {
-    /// Fully-qualified class to start the traversal from.
+    /// Fully-qualified class to start the LIVE BFS traversal from (no prebuilt index).
     pub class_name: String,
     /// "callees" (default — what this class transitively calls) or "callers" (what calls it).
     #[serde(default)]

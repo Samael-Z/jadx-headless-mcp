@@ -367,9 +367,10 @@ impl JadxMcpServer {
                           Default is `code`. `package` optionally restricts to a package prefix. \
                           Set `regex=true` to treat the term as a Java regex (matched with .find(); applies \
                           to every selected scope), `case_sensitive=true` for exact case. class/method/field \
-                          name scans are fast; code/comment scans decompile every class and are time-bounded \
-                          (see `timeout_ms`). When the code index is ready, search_in=code is served from it \
-                          (main-package scope, sub-second); pass full_scan=true for a full-corpus live scan.")]
+                          name scans run over the jadx model (fast). code/comment search runs over a \
+                          pre-decompiled Java-source index — sub-second once warm (poll `index_status` for \
+                          pre-decompile progress), falling back to a bounded live decompile scan (see \
+                          `timeout_ms`) for classes not yet indexed.")]
     async fn search_classes_by_keyword(
         &self,
         Parameters(req): Parameters<SearchClassesReq>,
@@ -390,22 +391,18 @@ impl JadxMcpServer {
         if let Some(b) = req.case_sensitive {
             q.push(("case_sensitive", b.to_string()));
         }
-        if let Some(b) = req.full_scan {
-            q.push(("full_scan", b.to_string()));
-        }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/search-classes-by-keyword", &q).await)
     }
 
-    #[tool(description = "Find which classes contain a DEX string constant. \
-                          Returns class FQN, line number of first hit, total hit count, code/smali \
-                          snippet, and which source matched (`matched_in`: 'smali' or 'code'). \
+    #[tool(description = "Find which classes contain a string constant, via a bounded live scan (no \
+                          global index). Returns class FQN, line number of first hit, total hit count, \
+                          code/smali snippet, and which source matched (`matched_in`: 'smali' or 'code'). \
                           \
-                          Default source is `smali` -- scans `const-string vN, \"<literal>\"` opcodes \
-                          across every class. This works even for R8/anti-tamper hardened classes \
+                          Default source is `both` -- the union of: jadx-decompiled Java source search \
+                          (`source=code`), and a per-class smali `const-string vN, \"<literal>\"` scan \
+                          (`source=smali`) which works even for R8/anti-tamper hardened classes \
                           (ByteDance, Tencent, etc.) whose decompiled Java is empty. \
-                          Pass `source=code` for jadx-decompiled source search (faster, but blind to \
-                          hardened classes), or `source=both` for the union. \
                           \
                           This is the right tool when you need to find which class loads a native \
                           library, calls a specific URL, or references a hardcoded API key. \
@@ -435,13 +432,14 @@ impl JadxMcpServer {
         Ok(self.get("/find-string-usages", &q).await)
     }
 
-    #[tool(description = "Enumerate DEX string CONSTANTS whose value matches a substring (default) or \
-                          regex, with the classes that declare each. Index-backed, so it is sub-second even \
-                          on a 100k+ class APK. This is the DISCOVERY counterpart to find_string_usages \
-                          (which takes an EXACT literal and returns its usages). Use it to sweep for URLs, \
-                          API keys, crypto constants, etc. — e.g. query 'https://' or regex=true with \
-                          '[A-Za-z0-9+/]{40,}={0,2}'. Requires the index to be `ready` (see index_status); \
-                          until then it returns an empty result plus the current index state.")]
+    #[tool(description = "Enumerate string CONSTANTS in decompiled Java source whose value matches a \
+                          substring (default) or regex, with the classes that declare each (one row per \
+                          distinct value). Java source-level: it narrows via the pre-decompiled Java index \
+                          when warm (sub-second; poll `index_status`), else runs a bounded live decompile \
+                          scan and may return partial results with `timed_out: true`. This is the DISCOVERY \
+                          counterpart to find_string_usages (which takes an EXACT literal and returns its \
+                          usages). Use it to sweep for URLs, API keys, crypto constants, etc. — e.g. query \
+                          'https://' or regex=true with '[A-Za-z0-9+/]{40,}={0,2}'.")]
     async fn search_string_constants(
         &self,
         Parameters(req): Parameters<SearchStringConstantsReq>,
@@ -456,15 +454,19 @@ impl JadxMcpServer {
         if let Some(p) = req.package {
             q.push(("package", p));
         }
+        if let Some(t) = req.timeout_ms {
+            q.push(("timeout_ms", t.to_string()));
+        }
         q.extend(pagination_qs(&req.offset, &req.count));
         Ok(self.get("/search-string-constants", &q).await)
     }
 
-    #[tool(description = "List the DIRECT subclasses / interface implementors of a class or interface, from \
-                          the type-hierarchy index (built from smali .super/.implements in the same pass). \
-                          Answers 'who extends BaseActivity' / 'who implements Callback'. `class_name` is the \
-                          FQN as shown in decompiled source (for SDK/framework base classes that's the DEX \
-                          name). Index-backed (poll index_status); paginated.")]
+    #[tool(description = "List the DIRECT subclasses / interface implementors of a class or interface, \
+                          enumerated LIVE from the jadx type-hierarchy model (no index, no warm-up; ready \
+                          as soon as the APK is loaded). Answers 'who extends BaseActivity' / 'who \
+                          implements Callback'. `class_name` is the FQN as shown in decompiled source (for \
+                          SDK/framework base classes that's the resolved dotted name, e.g. \
+                          android.app.Activity). Paginated.")]
     async fn get_subclasses(
         &self,
         Parameters(req): Parameters<SubclassesReq>,
@@ -477,12 +479,14 @@ impl JadxMcpServer {
         Ok(self.get("/subclasses", &q).await)
     }
 
-    #[tool(description = "Traverse the class-level CALL GRAPH from a class, multi-hop. direction=callees \
-                          (default) follows what the class transitively CALLS; direction=callers follows what \
-                          transitively calls IT. Each node is {class, depth}. This is the multi-hop counterpart \
-                          to get_xrefs_from_* (which give single-hop method-level detail). Ideal for tracing a \
+    #[tool(description = "Traverse the class-level CALL GRAPH from a class, multi-hop, via a LIVE BFS (no \
+                          prebuilt index). direction=callees (default) follows what the class transitively \
+                          CALLS (parsed from each class's smali invoke-* ops, so it works on hardened \
+                          classes); direction=callers follows what transitively calls IT (jadx use-in \
+                          edges). Each node is {class, depth}. This is the multi-hop counterpart to \
+                          get_xrefs_from_* (which give single-hop method-level detail). Ideal for tracing a \
                           protocol / crypto / signing path across classes. depth default 2 (max 20); \
-                          max_nodes default 500. Index-backed (poll index_status).")]
+                          max_nodes default 500 (bounds the work to stay well under a minute).")]
     async fn get_call_graph(
         &self,
         Parameters(req): Parameters<CallGraphReq>,
@@ -509,12 +513,14 @@ impl JadxMcpServer {
         Ok(self.get("/cache-stats", &[]).await)
     }
 
-    #[tool(description = "Report the const-string / method-name inverted index status \
-                          (absent | building | ready | failed) plus progress (built_classes/total_classes, \
-                          distinct_strings, distinct_methods, build_ms). This index powers fast \
-                          find_string_usages, search_string_constants and search_method_by_name; until it is \
-                          `ready` those fall back to a slower bounded live scan. Poll this after load_apk on \
-                          a large APK to know when the fast path is available.")]
+    #[tool(description = "Report background PRE-DECOMPILE progress (status: absent | building | ready | \
+                          failed) plus decompiled_classes/total_classes, distinct_tokens, budget_ms, \
+                          budget_exhausted, mem_stopped, coverage_complete, and ready. After load_apk the \
+                          server decompiles classes (main-package first) under a ~5min budget into a \
+                          persistent Java-source index that makes code keyword/string searches sub-second; \
+                          until `ready` those fall back to a bounded live scan. `coverage_complete=false` \
+                          means a large APK was indexed best-effort (budget/memory) — uncovered classes are \
+                          still searched live. Poll this to know when the fast path is fully available.")]
     async fn index_status(&self) -> Result<CallToolResult, McpError> {
         Ok(self.get("/index-status", &[]).await)
     }

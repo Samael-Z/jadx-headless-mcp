@@ -286,6 +286,26 @@ public final class XrefsRoutes {
         return out;
     }
 
+    /**
+     * Distinct callee CLASS FQNs (dotted) across all {@code invoke-*} ops in a class's smali — the
+     * set of classes this class directly calls into. Shared with the call-graph route so it doesn't
+     * duplicate the smali invoke-parsing. Self-references are excluded by the caller.
+     */
+    public static Set<String> calleeClassFqns(String smali) {
+        Set<String> out = new HashSet<>();
+        if (smali == null) return out;
+        for (String raw : smali.split("\n")) {
+            String line = raw.trim();
+            if (!line.startsWith("invoke")) continue;
+            Map<String, Object> t = parseInvokeTarget(line);
+            if (t != null) {
+                Object cn = t.get("class");
+                if (cn != null) out.add(cn.toString());
+            }
+        }
+        return out;
+    }
+
     private static void addInvoke(String line, List<Map<String, Object>> out, Set<String> seen) {
         Map<String, Object> t = parseInvokeTarget(line);
         if (t == null) return;

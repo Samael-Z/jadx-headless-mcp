@@ -109,10 +109,12 @@ public class JadxBridge {
         out.flush();
         System.err.println("[jadx-bridge] Listening on http://" + cli.host + ":" + actualPort);
 
-        // Space-for-time: build (or load from disk) the const-string inverted index in
-        // the background so find-string-usages becomes O(1) instead of re-scanning every
-        // class. Non-blocking -- searches fall back to the bounded live scan until READY.
-        context.startStringIndexBuild();
+        // Space-for-time: pre-decompile classes in the background (Java source, main-package
+        // first) under a <=5min wall-clock budget, indexing each into the persistent Java
+        // inverted index so keyword/code/string searches become sub-second once warm. Loads a
+        // persisted index from disk first when present. Non-blocking -- until the index is READY,
+        // searches fall back to a bounded live scan.
+        context.startPreDecompile(300_000L);
 
         CountDownLatch latch = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

@@ -3,6 +3,9 @@ package com.zin.jadxheadless.server.routes;
 import com.zin.jadxheadless.server.BridgeContext;
 import com.zin.jadxheadless.util.Errors;
 import com.zin.jadxheadless.util.Pagination;
+import com.zin.jadxheadless.util.Scan;
+import com.zin.jadxheadless.util.Scan.ScanResult;
+import com.zin.jadxheadless.util.StringIndex;
 import com.zin.jadxheadless.util.TextUtil;
 import io.javalin.http.Context;
 import jadx.api.JadxDecompiler;
@@ -30,9 +33,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -376,7 +377,6 @@ public final class ClassRoutes {
         int cap = count > 0 ? offset + count : 0;
         boolean regex = "true".equalsIgnoreCase(ctx.queryParam("regex"));
         boolean caseSensitive = "true".equalsIgnoreCase(ctx.queryParam("case_sensitive"));
-        boolean fullScan = "true".equalsIgnoreCase(ctx.queryParam("full_scan"));
 
         // Unified text matcher used by every location: a regex .find() when regex=true,
         // otherwise a (case-sensitive or -insensitive) substring test. This is what makes
@@ -396,7 +396,7 @@ public final class ClassRoutes {
         }
         final String tCase = term;
         final String tLower = term.toLowerCase();
-        final java.util.function.Predicate<String> textMatch = pat != null
+        final Predicate<String> textMatch = pat != null
                 ? s -> s != null && pat.matcher(s).find()
                 : (caseSensitive
                         ? s -> s != null && s.contains(tCase)
@@ -408,81 +408,71 @@ public final class ClassRoutes {
 
             Set<JavaClass> matched = new LinkedHashSet<>();
             boolean timedOut = false;
-            boolean codeScopeMainPkg = false;
             int scanned = 0;
 
             for (SearchLocation loc : locations) {
-                // METHOD/FIELD name: use the inverted index when eligible (plain case-insensitive
-                // substring, no regex) -- built from the same smali pass, so it skips the per-class
-                // getMethods()/getFields() live scan. Falls through to live scan if not READY.
-                if (!regex && !caseSensitive
-                        && (loc == SearchLocation.METHOD_NAME || loc == SearchLocation.FIELD_NAME)) {
-                    List<String> idxHit = (loc == SearchLocation.METHOD_NAME)
-                            ? context.stringIndex().lookupMethodContains(term, packageFilter, 0, null)
-                            : context.stringIndex().lookupFieldContains(term, packageFilter, 0, null);
-                    if (idxHit != null) {
-                        for (String fqn : idxHit) {
-                            JavaClass c = context.findClassByFqn(fqn);
-                            if (c != null) matched.add(c);
-                        }
-                        continue;
-                    }
-                }
-                // CODE: use the code-identifier index (main-package subset) unless full_scan / regex / case-sensitive.
-                if (loc == SearchLocation.CODE && !regex && !caseSensitive && !fullScan) {
-                    List<String> idxHit = context.stringIndex().lookupCodeContains(term, packageFilter, 0, null);
-                    if (idxHit != null) {
-                        for (String fqn : idxHit) {
-                            JavaClass c = context.findClassByFqn(fqn);
-                            if (c != null) matched.add(c);
-                        }
-                        codeScopeMainPkg = true;
-                        continue;
-                    }
-                }
-                // CLASS/METHOD/FIELD name matching is cheap string work (no decompile)
-                // -- the existing fast path returns in well under a second. CODE/COMMENT
-                // decompile every class, so they go through the time-bounded scan.
+                // CLASS / METHOD / FIELD name matching is cheap string work over the jadx model
+                // (no decompile) -- a bounded parallel scan over getMethods()/getFields()/getName()
+                // returns in well under a second. CODE/COMMENT need decompiled source.
                 if (loc != SearchLocation.CODE && loc != SearchLocation.COMMENT) {
-                    matched.addAll(searchIn(all, textMatch, loc, packageFilter, filterPkg));
+                    final SearchLocation nloc = loc;
+                    ScanResult<JavaClass> sr = Scan.boundedScan(all, timeoutMs, cap, c -> {
+                        if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
+                        return nameMatches(c, nloc, textMatch) ? c : null;
+                    });
+                    matched.addAll(sr.hits);
+                    timedOut |= sr.timedOut;
+                    scanned += sr.scanned;
                     continue;
                 }
-                final SearchLocation floc = loc;
-                ScanResult<JavaClass> sr = boundedScan(all, timeoutMs, cap, c -> {
-                    if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
-                    String code;
-                    try {
-                        code = decompiledCode(c);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                    if (code == null) return null;
-                    if (floc == SearchLocation.CODE) {
-                        return textMatch.test(code) ? c : null;
-                    }
-                    return commentMatches(code, textMatch) ? c : null;
-                });
-                matched.addAll(sr.hits);
-                timedOut |= sr.timedOut;
-                scanned += sr.scanned;
+                // CODE / COMMENT: route through the unified Java-source search. confirmSearch
+                // narrows via the pre-decompiled Java token index when ready (then full-text
+                // confirms each candidate), else falls back to a bounded live decompile scan.
+                final boolean isComment = loc == SearchLocation.COMMENT;
+                Predicate<String> matcher = isComment
+                        ? code -> commentMatches(code, textMatch)
+                        : textMatch;
+                ConfirmResult cr = confirmSearch(term, matcher, packageFilter, regex, caseSensitive, timeoutMs, cap);
+                matched.addAll(cr.hits);
+                timedOut |= cr.timedOut;
+                scanned += cr.scanned;
             }
             Map<String, Object> out = Pagination.paginate(
                     new ArrayList<>(matched), "class-list", "classes", offset, count, JavaClass::getFullName);
             if (regex) out.put("regex", true);
-            if (codeScopeMainPkg) {
-                out.put("code_scope", "main-package-index — pass full_scan=true for a full-corpus live scan (slower)");
-            }
             if (timedOut) {
                 out.put("timed_out", true);
                 out.put("scanned", scanned);
                 out.put("total_classes", all.size());
                 out.put("has_more", true);
-                out.put("note", "Code/comment scan hit the " + timeoutMs
-                        + "ms budget; results are partial. Prefer search_in=class (fast) or narrow the query / raise ?timeout_ms=.");
+                out.put("note", "Scan hit the " + timeoutMs
+                        + "ms budget; results are partial. Prefer search_in=class (fast), narrow the query, "
+                        + "raise ?timeout_ms=, or wait for the pre-decompile index (poll index_status).");
             }
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Search failed: " + e.getMessage(), e, logger);
+        }
+    }
+
+    /** True if {@code cls}'s name/method-names/field-names match {@code textMatch} for the given location. */
+    private static boolean nameMatches(JavaClass cls, SearchLocation loc, Predicate<String> textMatch) {
+        switch (loc) {
+            case CLASS_NAME:
+                return textMatch.test(cls.getName());
+            case METHOD_NAME:
+                for (JavaMethod m : cls.getMethods()) {
+                    if (textMatch.test(m.getName())) return true;
+                    if (m.isConstructor() && textMatch.test(cls.getName())) return true;
+                }
+                return false;
+            case FIELD_NAME:
+                for (JavaField f : cls.getFields()) {
+                    if (textMatch.test(f.getName())) return true;
+                }
+                return false;
+            default:
+                return false;
         }
     }
 
@@ -573,71 +563,6 @@ public final class ClassRoutes {
         }
     }
 
-    /** Outcome of a {@link #boundedScan}: collected hits plus progress/termination metadata. */
-    private static final class ScanResult<T> {
-        final List<T> hits;
-        final boolean timedOut;
-        final boolean capped;
-        final int scanned;
-        final int total;
-        ScanResult(List<T> hits, boolean timedOut, boolean capped, int scanned, int total) {
-            this.hits = hits;
-            this.timedOut = timedOut;
-            this.capped = capped;
-            this.scanned = scanned;
-            this.total = total;
-        }
-    }
-
-    /**
-     * Run {@code perClass} over every class in parallel, but stop early once either
-     * (a) the wall-clock budget {@code timeoutMs} is exceeded, or (b) {@code cap}
-     * non-null hits have been collected ({@code cap <= 0} disables the cap).
-     *
-     * <p>This is the fix for the "search hangs for minutes and monopolizes the
-     * single bridge worker" class of problem: callers always get a bounded
-     * response. When the scan stops early, {@code timedOut}/{@code capped} say why
-     * and {@code scanned} reports how many of {@code total} classes were examined.
-     *
-     * <p>Note: a parallel stream cannot be hard-cancelled, so after the stop flag
-     * trips the remaining elements still get scheduled — but each becomes a cheap
-     * volatile-read no-op, so wall-time stays bounded.
-     */
-    private <T> ScanResult<T> boundedScan(
-            List<JavaClass> all, long timeoutMs, int cap,
-            java.util.function.Function<JavaClass, T> perClass) {
-        long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
-        AtomicBoolean stop = new AtomicBoolean(false);
-        AtomicBoolean timedOut = new AtomicBoolean(false);
-        AtomicBoolean capped = new AtomicBoolean(false);
-        AtomicInteger scanned = new AtomicInteger();
-        ConcurrentLinkedQueue<T> hits = new ConcurrentLinkedQueue<>();
-        all.parallelStream().forEach(c -> {
-            if (stop.get()) return;
-            if (System.nanoTime() > deadline) {
-                timedOut.set(true);
-                stop.set(true);
-                return;
-            }
-            scanned.incrementAndGet();
-            T r;
-            try {
-                r = perClass.apply(c);
-            } catch (Throwable t) {
-                r = null;
-            }
-            if (r != null) {
-                hits.add(r);
-                if (cap > 0 && hits.size() >= cap) {
-                    capped.set(true);
-                    stop.set(true);
-                }
-            }
-        });
-        return new ScanResult<>(new ArrayList<>(hits), timedOut.get(), capped.get(),
-                scanned.get(), all.size());
-    }
-
     /**
      * Attach scan progress/termination metadata to a paginated envelope and fix up
      * {@code has_more}: when a scan stopped early (timeout or hit cap) the true total
@@ -665,19 +590,18 @@ public final class ClassRoutes {
      * (which is res/values&#42;/strings.xml -- Android string resources, not
      * DEX string constants).
      *
-     * <p>Search source -- selectable via the {@code source} query parameter:
+     * <p>Always a bounded live scan (deadline + cap) — NO global index. Search source is selectable
+     * via the {@code source} query parameter:
      * <ul>
-     *   <li><b>smali</b> (default): scans the Dalvik smali listing for
-     *       {@code const-string vN, "<literal>"} opcodes. Authoritative,
-     *       independent of whether the class is decompilable. The right
-     *       choice for finding native-library loads, hardcoded URLs, or
-     *       API keys in R8/anti-tamper hardened classes (e.g. ByteDance,
-     *       Tencent) where the Java decompile is empty.</li>
-     *   <li><b>code</b>: scans jadx-decompiled Java source. Faster on big
-     *       APKs because decompile is cached, but returns 0 hits on classes
-     *       that jadx refuses to decompile.</li>
-     *   <li><b>both</b>: report a class if either source contains the
-     *       literal. The {@code matched_in} field tells you which.</li>
+     *   <li><b>code</b>: scans jadx-decompiled Java source (cached, so fast on repeat). Returns 0
+     *       hits on classes that jadx refuses to decompile.</li>
+     *   <li><b>smali</b>: scans each class's Dalvik smali listing for
+     *       {@code const-string vN, "<literal>"} opcodes. Authoritative, independent of whether the
+     *       class is decompilable — the right choice for finding native-library loads, hardcoded
+     *       URLs, or API keys in R8/anti-tamper hardened classes (e.g. ByteDance, Tencent) where the
+     *       Java decompile is empty.</li>
+     *   <li><b>both</b> (default): report a class if either source contains the literal. The
+     *       {@code matched_in} field tells you which.</li>
      * </ul>
      */
     public void handleFindStringUsages(Context ctx) {
@@ -699,12 +623,12 @@ public final class ClassRoutes {
         boolean filterPkg = isValidPackageFilter(packageFilter);
         String sourceParam = ctx.queryParam("source");
         String source = (sourceParam == null || sourceParam.isEmpty())
-                ? "smali" : sourceParam.toLowerCase();
+                ? "both" : sourceParam.toLowerCase();
         boolean useCode = source.equals("code") || source.equals("both");
         boolean useSmali = source.equals("smali") || source.equals("both");
         if (!useCode && !useSmali) {
             Errors.send(ctx, 400,
-                    "Invalid 'source' parameter: expected 'smali' (default), 'code', or 'both'",
+                    "Invalid 'source' parameter: expected 'code', 'smali', or 'both' (default)",
                     logger);
             return;
         }
@@ -726,55 +650,12 @@ public final class ClassRoutes {
         int cap = count > 0 ? offset + count : 0;
 
         try {
-            // ---- Fast path: const-string inverted index (space-for-time) ----
-            // Eligible only for the exact smali query (source=smali, case-sensitive),
-            // which the index reproduces precisely AND with an accurate total. Any other
-            // mode (code/both, substring, case-insensitive) or a not-yet-ready index
-            // falls through to the bounded live scan below.
-            boolean indexEligible = fSmali && !fCode && cs;
-            if (indexEligible) {
-                List<String> fqns = context.stringIndex().lookup(literal, packageFilter);
-                if (fqns != null) { // index is READY
-                    int total = fqns.size();
-                    int from = Math.min(Math.max(offset, 0), total);
-                    int to = count <= 0 ? total : Math.min(from + count, total);
-                    List<Map<String, Object>> usages = new ArrayList<>(Math.max(0, to - from));
-                    for (int i = from; i < to; i++) {
-                        String fqn = fqns.get(i);
-                        Map<String, Object> row = new HashMap<>();
-                        row.put("class_name", fqn);
-                        row.put("matched_in", "smali");
-                        // Snippet/line: only the page's (few) classes need their smali fetched.
-                        JavaClass c = context.findClassByFqn(fqn);
-                        String smali = c != null ? safeSmali(c) : null;
-                        if (smali != null) {
-                            Map<String, Object> hit = scanForLiteral(smali, smaliHaystack, cs);
-                            if (hit != null) {
-                                row.put("line", hit.get("line"));
-                                row.put("hits", hit.get("hits"));
-                                row.put("snippet", hit.get("snippet"));
-                            }
-                        }
-                        usages.add(row);
-                    }
-                    Map<String, Object> out = new HashMap<>();
-                    out.put("type", "string-usages");
-                    out.put("offset", from);
-                    out.put("count", usages.size());
-                    out.put("page_size", Math.max(count, 0));
-                    out.put("total", total);
-                    out.put("returned", usages.size());
-                    out.put("has_more", to < total);
-                    out.put("usages", usages);
-                    out.put("index", "ready");
-                    ctx.json(out);
-                    return;
-                }
-            }
-
-            // ---- Live bounded scan (index absent/building, or non-exact query) ----
+            // Bounded live scan, no global index. Per class: source=code scans decompiled Java
+            // (cached), source=smali scans that single class's smali (works even on hardened classes
+            // jadx can't decompile), source=both unions them. The deadline + cap keep it responsive
+            // on a 100k+ class APK.
             List<JavaClass> all = context.getClassesWithInners();
-            ScanResult<Map<String, Object>> sr = boundedScan(all, timeoutMs, cap, c -> {
+            ScanResult<Map<String, Object>> sr = Scan.boundedScan(all, timeoutMs, cap, c -> {
                 if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
                 return findStringUsageInClass(
                         c, fSmali, smaliNeedle, smaliHaystack,
@@ -783,7 +664,6 @@ public final class ClassRoutes {
             Map<String, Object> out = Pagination.paginate(
                     sr.hits, "string-usages", "usages", offset, count, x -> x);
             decorateScan(out, sr, timeoutMs);
-            out.put("index", context.stringIndex().status().name().toLowerCase());
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Find string usages failed: " + e.getMessage(), e, logger);
@@ -873,18 +753,27 @@ public final class ClassRoutes {
         ctx.json(context.cache().stats());
     }
 
-    /** Const-string inverted index build/load status (absent|building|ready|failed) + progress. */
+    /** Pre-decompile / Java-index progress (status absent|building|ready|failed + decompiled/total, budget, coverage). */
     public void handleIndexStatus(Context ctx) {
         ctx.json(context.stringIndex().statusMap());
     }
 
+    /** Matches a Java string literal {@code "..."} (handles escaped quotes/backslashes inside). */
+    private static final Pattern STRING_LITERAL = Pattern.compile("\"(?:\\\\.|[^\"\\\\])*\"");
+
+    /** Distinct string-literal VALUES the scan can collect before stopping, to bound memory/response. */
+    private static final int MAX_STRING_CONSTANT_VALUES = 5000;
+
     /**
-     * Discovery search over the DEX string-constant pool: list embedded string CONSTANTS whose
-     * value matches {@code query} (substring by default, or {@code regex=true}) plus the classes
-     * that declare each. Powered by the const-string inverted index, so it is sub-second even on
-     * a 100k+ class APK — the opposite end from {@link #handleFindStringUsages}, which takes an
-     * EXACT literal and returns its usages. Use this to enumerate URLs, API keys, crypto
+     * Discovery search over string CONSTANTS in decompiled Java source: list distinct string-literal
+     * VALUES whose text matches {@code query} (substring by default, or {@code regex=true}), each with
+     * the classes that declare it. This is the DISCOVERY counterpart to {@link #handleFindStringUsages}
+     * (which takes an EXACT literal and returns its usages). Use it to enumerate URLs, API keys, crypto
      * constants, etc. ("show every string containing 'http' / matching a base64 pattern").
+     *
+     * <p>Java source-level, NO global index: it narrows via the pre-decompiled Java token index when
+     * ready (then extracts + matches literals from the candidates' source), else runs a bounded live
+     * decompile scan. Results are bounded by a deadline + a distinct-value cap. Paginated.
      */
     public void handleSearchStringConstants(Context ctx) {
         String query = ctx.queryParam("query");
@@ -896,36 +785,135 @@ public final class ClassRoutes {
         String caseParam = ctx.queryParam("case_sensitive");
         boolean caseSensitive = caseParam != null && caseParam.equalsIgnoreCase("true");
         String packageFilter = ctx.queryParam("package");
+        boolean filterPkg = isValidPackageFilter(packageFilter);
         int offset = parsePositive(ctx, "offset", 0);
         int count = parsePositive(ctx, "count", 100);
-        // Over-fetch by one so pagination can report has_more accurately when the index search caps.
-        int searchCap = count > 0 ? offset + count + 1 : 0;
-        try {
-            List<Map<String, Object>> hits;
+        long timeoutMs = parsePositiveLong(ctx, "timeout_ms", DEFAULT_SEARCH_TIMEOUT_MS);
+
+        // Predicate over an UNQUOTED literal value.
+        final Predicate<String> valueMatch;
+        if (regex) {
+            final Pattern p;
             try {
-                hits = context.stringIndex().searchKeys(query, caseSensitive, regex,
-                        isValidPackageFilter(packageFilter) ? packageFilter : null, searchCap);
+                p = Pattern.compile(query, caseSensitive ? 0 : Pattern.CASE_INSENSITIVE);
             } catch (java.util.regex.PatternSyntaxException pe) {
                 Errors.send(ctx, 400, "Invalid regex '" + query + "': " + pe.getMessage(), logger);
                 return;
             }
-            if (hits == null) {
-                // Index not READY: report status rather than silently launching a minutes-long live scan.
-                String st = context.stringIndex().status().name().toLowerCase();
-                Map<String, Object> out = new HashMap<>();
-                out.put("type", "string-constants");
-                out.put("index", st);
-                out.put("query", query);
-                out.put("results", new ArrayList<>());
-                out.put("note", "String index not ready (" + st + "). Retry shortly (poll index_status). "
-                        + "For an exact known literal, find_string_usages works without the index.");
-                ctx.json(out);
-                return;
+            valueMatch = v -> p.matcher(v).find();
+        } else if (caseSensitive) {
+            valueMatch = v -> v.contains(query);
+        } else {
+            String ql = query.toLowerCase();
+            valueMatch = v -> v.toLowerCase().contains(ql);
+        }
+        // A class is a candidate iff its source contains the query text at all (literal contents are
+        // tokenized into the index, so candidate narrowing still works); the per-literal matcher above
+        // does the precise filtering.
+        final Predicate<String> sourceMatch = caseSensitive
+                ? src -> src.contains(query)
+                : (regex
+                        ? src -> true /* regex: can't cheaply pre-filter source, confirm via literals */
+                        : src -> src.toLowerCase().contains(query.toLowerCase()));
+
+        try {
+            // value -> sorted set of declaring class FQNs
+            Map<String, Set<String>> byValue = new java.util.concurrent.ConcurrentHashMap<>();
+            java.util.concurrent.atomic.AtomicBoolean capped = new java.util.concurrent.atomic.AtomicBoolean(false);
+            java.util.function.Function<JavaClass, Boolean> perClass = c -> {
+                if (filterPkg && !matchesPackageFilter(c, packageFilter)) return Boolean.FALSE;
+                String code;
+                try {
+                    code = decompiledCode(c);
+                } catch (Exception e) {
+                    return Boolean.FALSE;
+                }
+                if (code == null || code.isEmpty() || !sourceMatch.test(code)) return Boolean.FALSE;
+                String fqn = c.getFullName();
+                boolean any = false;
+                java.util.regex.Matcher m = STRING_LITERAL.matcher(code);
+                while (m.find()) {
+                    String raw = m.group();
+                    String val = raw.substring(1, raw.length() - 1); // strip surrounding quotes
+                    if (val.isEmpty() || !valueMatch.test(val)) continue;
+                    if (!byValue.containsKey(val) && byValue.size() >= MAX_STRING_CONSTANT_VALUES) {
+                        capped.set(true);
+                        continue;
+                    }
+                    byValue.computeIfAbsent(val, k -> java.util.Collections.synchronizedSet(new java.util.TreeSet<>()))
+                            .add(fqn);
+                    any = true;
+                }
+                return any ? Boolean.TRUE : Boolean.FALSE;
+            };
+
+            // Candidate narrowing via the warm Java token index when possible, else full live scan.
+            boolean timedOut;
+            int scanned;
+            String tok = StringIndex.longestToken(query);
+            StringIndex idx = context.stringIndex();
+            String pkgArg = filterPkg ? packageFilter : null;
+            if (tok != null && idx.codeIndexReady()) {
+                List<String> candidates = idx.lookupCodeContains(tok, pkgArg, 0, null);
+                long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+                boolean to = false;
+                int sc = 0;
+                if (candidates != null) {
+                    for (String fqn : candidates) {
+                        if (System.nanoTime() > deadline) { to = true; break; }
+                        sc++;
+                        JavaClass c = context.findClassByFqn(fqn);
+                        if (c != null) perClass.apply(c);
+                    }
+                }
+                // Cover not-yet-indexed classes on a partial index.
+                boolean coverageComplete = Boolean.TRUE.equals(idx.statusMap().get("coverage_complete"));
+                if (!to && !coverageComplete) {
+                    Set<String> indexed = idx.indexedFqns();
+                    List<JavaClass> pending = new ArrayList<>();
+                    for (JavaClass c : context.getClassesWithInners()) {
+                        if (!indexed.contains(safeFullName(c))) pending.add(c);
+                    }
+                    ScanResult<Boolean> sr = Scan.boundedScan(pending, timeoutMs, 0, perClass::apply);
+                    to |= sr.timedOut;
+                    sc += sr.scanned;
+                }
+                timedOut = to;
+                scanned = sc;
+            } else {
+                List<JavaClass> all = context.getClassesWithInners();
+                ScanResult<Boolean> sr = Scan.boundedScan(all, timeoutMs, 0, perClass::apply);
+                timedOut = sr.timedOut;
+                scanned = sr.scanned;
             }
-            Map<String, Object> out = Pagination.paginate(hits, "string-constants", "results", offset, count, x -> x);
-            out.put("index", "ready");
+
+            // Materialize results: one row per distinct value, sorted by value for determinism.
+            List<Map<String, Object>> results = new ArrayList<>(byValue.size());
+            List<String> values = new ArrayList<>(byValue.keySet());
+            java.util.Collections.sort(values);
+            for (String val : values) {
+                Map<String, Object> row = new HashMap<>();
+                row.put("value", val);
+                List<String> classes = new ArrayList<>(byValue.get(val));
+                row.put("classes", classes);
+                row.put("class_count", classes.size());
+                results.add(row);
+            }
+            Map<String, Object> out = Pagination.paginate(results, "string-constants", "results", offset, count, x -> x);
             out.put("query", query);
             if (regex) out.put("regex", true);
+            out.put("distinct_values", results.size());
+            out.put("scanned", scanned);
+            if (timedOut) {
+                out.put("timed_out", true);
+                out.put("note", "Scan hit the " + timeoutMs + "ms budget; results are partial. "
+                        + "Narrow the query, raise ?timeout_ms=, or wait for the pre-decompile index (poll index_status).");
+            }
+            if (capped.get()) {
+                out.put("values_capped", true);
+                out.put("note_capped", "Stopped collecting after " + MAX_STRING_CONSTANT_VALUES
+                        + " distinct values; narrow the query for a complete set.");
+            }
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Search string constants failed: " + e.getMessage(), e, logger);
@@ -933,32 +921,29 @@ public final class ClassRoutes {
     }
 
     /**
-     * Direct subclasses / interface implementors of a class, from the type-hierarchy index.
-     * {@code class_name} is matched against the smali super/interface ref (the original DEX FQN —
-     * for SDK/framework base classes and un-obfuscated classes that equals the decompiled FQN).
-     * Index-backed; requires the index to be {@code ready}.
+     * Direct subclasses / interface implementors of a class, enumerated from the jadx model's
+     * type-hierarchy (each class's super/interface refs). {@code class_name} is the FQN as shown in
+     * decompiled source (for SDK/framework base classes that's the resolved dotted name, e.g.
+     * {@code android.app.Activity}). Model-only (no decompile), so it works as soon as the APK is
+     * loaded — no index warm-up needed.
      */
     public void handleSubclasses(Context ctx) {
         String className = requireClassName(ctx);
         if (className == null) return;
         try {
             String packageFilter = ctx.queryParam("package");
-            List<String> subs = context.stringIndex().lookupSubtypes(className,
-                    isValidPackageFilter(packageFilter) ? packageFilter : null);
-            if (subs == null) {
-                String st = context.stringIndex().status().name().toLowerCase();
-                Map<String, Object> out = new HashMap<>();
-                out.put("type", "subclasses");
-                out.put("class", className);
-                out.put("index", st);
-                out.put("subclasses", new ArrayList<>());
-                out.put("note", "Type-hierarchy index not ready (" + st + "). Retry shortly (poll index_status).");
-                ctx.json(out);
-                return;
+            boolean filterPkg = isValidPackageFilter(packageFilter);
+            List<String> subs = context.subtypeIndex().get(className);
+            List<String> filtered = new ArrayList<>();
+            if (subs != null) {
+                for (String fqn : subs) {
+                    if (!filterPkg || fqn.startsWith(packageFilter + ".") || fqn.equals(packageFilter)) {
+                        filtered.add(fqn);
+                    }
+                }
             }
-            Map<String, Object> out = Pagination.paginate(ctx, subs, "subclasses", "subclasses", x -> x);
+            Map<String, Object> out = Pagination.paginate(ctx, filtered, "subclasses", "subclasses", x -> x);
             out.put("class", className);
-            out.put("index", "ready");
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Subclasses lookup failed: " + e.getMessage(), e, logger);
@@ -966,10 +951,13 @@ public final class ClassRoutes {
     }
 
     /**
-     * Multi-hop class-level call-graph traversal from {@code class_name}, BFS over the prebuilt
-     * call graph. {@code direction}=callees (default) follows what the class transitively calls;
-     * =callers follows what transitively calls it. Bounded by {@code depth} (hops) and
-     * {@code max_nodes}. Index-backed; requires the call graph to be {@code ready}.
+     * Multi-hop class-level call-graph traversal from {@code class_name} via a LIVE BFS — no global
+     * index. {@code direction}=callees (default) follows what the class transitively calls (parsed
+     * from each visited class's smali {@code invoke-*} ops, reusing the xrefs-from extractor, so it
+     * works on hardened classes); =callers follows what transitively calls it (jadx
+     * {@code ClassNode.getUseIn()}). Each node is {@code {class, depth}}. Bounded by {@code depth}
+     * (hops, cap 20) and {@code max_nodes} (default 500) so it stays well under a minute; the start
+     * class is excluded; the package filter applies to returned nodes. Paginated.
      */
     public void handleCallGraph(Context ctx) {
         String className = requireClassName(ctx);
@@ -982,34 +970,90 @@ public final class ClassRoutes {
         int cap = parsePositive(ctx, "max_nodes", 500);
         if (cap <= 0) cap = 500;
         String packageFilter = ctx.queryParam("package");
+        boolean filterPkg = isValidPackageFilter(packageFilter);
         try {
-            List<Map<String, Object>> nodes = context.stringIndex().traverseCallGraph(
-                    className, callees, depth, cap,
-                    isValidPackageFilter(packageFilter) ? packageFilter : null);
-            if (nodes == null) {
-                String st = context.stringIndex().status().name().toLowerCase();
-                Map<String, Object> out = new HashMap<>();
-                out.put("type", "call-graph");
-                out.put("class", className);
-                out.put("index", st);
-                out.put("nodes", new ArrayList<>());
-                out.put("note", "Call-graph index not ready (" + st + "). Retry shortly (poll index_status).");
-                ctx.json(out);
+            JavaClass start = findClass(className);
+            if (start == null) {
+                Errors.send(ctx, 404, "Class not found: " + className, logger);
                 return;
             }
+            // BFS over class FQNs. visited bounds total work to <= cap distinct classes regardless of
+            // graph fan-out, keeping wall-time well under a minute. Each popped class is expanded once.
+            Set<String> visited = new HashSet<>();
+            visited.add(start.getFullName());
+            java.util.ArrayDeque<String[]> frontier = new java.util.ArrayDeque<>();
+            frontier.add(new String[]{ start.getFullName(), "0" });
+            Map<String, Integer> resultDepth = new java.util.LinkedHashMap<>();
+            boolean truncated = false;
+
+            while (!frontier.isEmpty()) {
+                String[] cur = frontier.poll();
+                String fqn = cur[0];
+                int d = Integer.parseInt(cur[1]);
+                if (d >= depth) continue;
+                JavaClass c = findClass(fqn);
+                if (c == null) continue;
+                Set<String> neighbors = callees ? calleesOf(c) : callersOf(c);
+                for (String n : neighbors) {
+                    if (n == null || n.equals(start.getFullName()) || !visited.add(n)) continue;
+                    int nd = d + 1;
+                    if (!filterPkg || n.startsWith(packageFilter + ".") || n.equals(packageFilter)) {
+                        resultDepth.put(n, nd);
+                    }
+                    if (visited.size() >= cap + 1) { truncated = true; break; }
+                    frontier.add(new String[]{ n, Integer.toString(nd) });
+                }
+                if (truncated) break;
+            }
+
+            List<Map<String, Object>> nodes = new ArrayList<>(resultDepth.size());
+            for (Map.Entry<String, Integer> e : resultDepth.entrySet()) {
+                Map<String, Object> row = new HashMap<>();
+                row.put("class", e.getKey());
+                row.put("depth", e.getValue());
+                nodes.add(row);
+            }
             nodes.sort((a, b) -> {
-                int d = Integer.compare((Integer) a.get("depth"), (Integer) b.get("depth"));
-                return d != 0 ? d : String.valueOf(a.get("class")).compareTo(String.valueOf(b.get("class")));
+                int dd = Integer.compare((Integer) a.get("depth"), (Integer) b.get("depth"));
+                return dd != 0 ? dd : String.valueOf(a.get("class")).compareTo(String.valueOf(b.get("class")));
             });
             Map<String, Object> out = Pagination.paginate(ctx, nodes, "call-graph", "nodes", x -> x);
-            out.put("class", className);
+            out.put("class", start.getFullName());
             out.put("direction", callees ? "callees" : "callers");
             out.put("max_depth", depth);
-            out.put("index", "ready");
+            if (truncated) {
+                out.put("truncated", true);
+                out.put("note", "Traversal hit the max_nodes=" + cap + " budget; graph is partial. "
+                        + "Lower depth or raise max_nodes for more.");
+            }
             ctx.json(out);
         } catch (Exception e) {
             Errors.internal(ctx, "Call-graph traversal failed: " + e.getMessage(), e, logger);
         }
+    }
+
+    /** Distinct callee class FQNs of {@code c}, parsed from its smali invoke ops (reuses XrefsRoutes). */
+    private Set<String> calleesOf(JavaClass c) {
+        try {
+            return XrefsRoutes.calleeClassFqns(safeSmali(c));
+        } catch (Throwable t) {
+            return java.util.Collections.emptySet();
+        }
+    }
+
+    /** Distinct caller class FQNs of {@code c}, from jadx's class-level use-in edges. */
+    private Set<String> callersOf(JavaClass c) {
+        Set<String> out = new HashSet<>();
+        try {
+            jadx.core.dex.nodes.ClassNode node = c.getClassNode();
+            if (node == null) return out;
+            for (jadx.core.dex.nodes.ClassNode user : node.getUseIn()) {
+                if (user != null) out.add(user.getFullName());
+            }
+        } catch (Throwable t) {
+            // best-effort
+        }
+        return out;
     }
 
     public void handleCacheClear(Context ctx) {
@@ -1098,61 +1142,126 @@ public final class ClassRoutes {
         return false;
     }
 
-    private Set<JavaClass> searchIn(List<JavaClass> all, java.util.function.Predicate<String> textMatch,
-                                    SearchLocation loc, String packageFilter, boolean filterPkg) {
-        switch (loc) {
-            case CLASS_NAME:
-                return all.parallelStream()
-                        .filter(c -> (!filterPkg || matchesPackageFilter(c, packageFilter))
-                                && textMatch.test(c.getName()))
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-            case METHOD_NAME:
-                return all.parallelStream()
-                        .filter(c -> {
-                            if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
-                            for (JavaMethod m : c.getMethods()) {
-                                if (textMatch.test(m.getName())) return true;
-                                if (m.isConstructor() && textMatch.test(c.getName())) return true;
-                            }
-                            return false;
-                        })
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-            case FIELD_NAME:
-                return all.parallelStream()
-                        .filter(c -> {
-                            if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
-                            for (JavaField f : c.getFields()) {
-                                if (textMatch.test(f.getName())) return true;
-                            }
-                            return false;
-                        })
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-            case CODE:
-                return all.parallelStream()
-                        .filter(c -> {
-                            try {
-                                if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
-                                String code = decompiledCode(c);
-                                return code != null && textMatch.test(code);
-                            } catch (Exception e) {
-                                return false;
-                            }
-                        })
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-            case COMMENT:
-                return all.parallelStream()
-                        .filter(c -> {
-                            try {
-                                if (filterPkg && !matchesPackageFilter(c, packageFilter)) return false;
-                                String code = decompiledCode(c);
-                                return code != null && commentMatches(code, textMatch);
-                            } catch (Exception e) {
-                                return false;
-                            }
-                        })
-                        .collect(Collectors.toCollection(LinkedHashSet::new));
-            default:
-                return new HashSet<>();
+    /** Result of {@link #confirmSearch}: matching classes plus bounded-scan progress metadata. */
+    private static final class ConfirmResult {
+        final Set<JavaClass> hits;
+        final boolean timedOut;
+        final int scanned;
+        ConfirmResult(Set<JavaClass> hits, boolean timedOut, int scanned) {
+            this.hits = hits;
+            this.timedOut = timedOut;
+            this.scanned = scanned;
+        }
+    }
+
+    /**
+     * Unified Java-source search over decompiled code, bounded by {@code timeoutMs} + {@code cap}.
+     *
+     * <p>{@code sourceMatch} is the confirmation predicate applied to a class's full decompiled
+     * source (for code search it is the term matcher; for comment search it scans only comment
+     * spans). Strategy:
+     * <ol>
+     *   <li>If the query yields a usable identifier token AND the pre-decompiled Java index is
+     *       READY, narrow to candidate FQNs via {@link StringIndex#lookupCodeContains} and full-text
+     *       confirm each (source comes from the decompilation cache, decompiling on demand). This is
+     *       sub-second on a warm index even for punctuation queries like {@code getInstance("AES}.</li>
+     *   <li>Because the index may be partial (huge APK best-effort), ALSO bounded-scan the classes
+     *       not yet indexed ({@code getClassesWithInners()} minus {@code indexedFqns()}), live-
+     *       decompiling and confirming, so coverage isn't silently limited to the indexed subset.</li>
+     *   <li>If there's no usable token (e.g. punctuation-only query) OR the index isn't ready, run a
+     *       bounded full live scan over every class.</li>
+     * </ol>
+     */
+    private ConfirmResult confirmSearch(String query, Predicate<String> sourceMatch, String packageFilter,
+                                        boolean regex, boolean caseSensitive, long timeoutMs, int cap) {
+        boolean filterPkg = isValidPackageFilter(packageFilter);
+        String pkgArg = filterPkg ? packageFilter : null;
+        String tok = StringIndex.longestToken(query);
+        StringIndex idx = context.stringIndex();
+        Set<JavaClass> hits = new LinkedHashSet<>();
+        boolean timedOut = false;
+        int scanned = 0;
+
+        if (tok != null && idx.codeIndexReady()) {
+            // ---- candidate narrowing via the warm Java token index ----
+            List<String> candidates = idx.lookupCodeContains(tok, pkgArg, 0, null);
+            if (candidates != null) {
+                long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+                for (String fqn : candidates) {
+                    if (System.nanoTime() > deadline) { timedOut = true; break; }
+                    scanned++;
+                    String src = context.cache().get(fqn);
+                    if (src == null) {
+                        JavaClass c = context.findClassByFqn(fqn);
+                        if (c == null) continue;
+                        try {
+                            src = decompiledCode(c);
+                        } catch (Exception e) {
+                            continue;
+                        }
+                    }
+                    if (src != null && sourceMatch.test(src)) {
+                        JavaClass c = context.findClassByFqn(fqn);
+                        if (c != null) {
+                            hits.add(c);
+                            if (cap > 0 && hits.size() >= cap) return new ConfirmResult(hits, timedOut, scanned);
+                        }
+                    }
+                }
+            }
+            // ---- bounded live scan of classes the (possibly partial) index has not covered ----
+            // Skip when the pre-decompile achieved full coverage (every class already indexed +
+            // confirmed above); otherwise sweep the not-yet-indexed remainder so a best-effort
+            // index on a huge APK doesn't silently cap results to its subset.
+            boolean coverageComplete = Boolean.TRUE.equals(idx.statusMap().get("coverage_complete"));
+            if (!coverageComplete) {
+                Set<String> indexed = idx.indexedFqns();
+                List<JavaClass> pending = new ArrayList<>();
+                for (JavaClass c : context.getClassesWithInners()) {
+                    String fqn = safeFullName(c);
+                    if (!indexed.contains(fqn)) pending.add(c);
+                }
+                if (!pending.isEmpty()) {
+                    int remainingCap = cap > 0 ? Math.max(1, cap - hits.size()) : 0;
+                    ScanResult<JavaClass> sr = Scan.boundedScan(pending, timeoutMs, remainingCap, c -> {
+                        if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
+                        String code;
+                        try {
+                            code = decompiledCode(c);
+                        } catch (Exception e) {
+                            return null;
+                        }
+                        return code != null && sourceMatch.test(code) ? c : null;
+                    });
+                    hits.addAll(sr.hits);
+                    timedOut |= sr.timedOut;
+                    scanned += sr.scanned;
+                }
+            }
+            return new ConfirmResult(hits, timedOut, scanned);
+        }
+
+        // ---- no usable token, or index not ready: bounded full live scan ----
+        List<JavaClass> all = context.getClassesWithInners();
+        ScanResult<JavaClass> sr = Scan.boundedScan(all, timeoutMs, cap, c -> {
+            if (filterPkg && !matchesPackageFilter(c, packageFilter)) return null;
+            String code;
+            try {
+                code = decompiledCode(c);
+            } catch (Exception e) {
+                return null;
+            }
+            return code != null && sourceMatch.test(code) ? c : null;
+        });
+        return new ConfirmResult(new LinkedHashSet<>(sr.hits), sr.timedOut, sr.scanned);
+    }
+
+    /** Wrap {@code getFullName()} -- some jadx versions throw on unloadable classes. */
+    private static String safeFullName(JavaClass c) {
+        try {
+            return c.getFullName();
+        } catch (Throwable t) {
+            return "?";
         }
     }
 

@@ -1,6 +1,16 @@
 package com.zin.jadxheadless.util;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,6 +24,10 @@ import java.util.zip.Inflater;
  * which matters because we may be caching tens of thousands of classes during a code search.
  */
 public final class DecompilationCache {
+
+    /** On-disk format for the persisted source cache (.jsrc). "JSRC". */
+    private static final int MAGIC = 0x4A535243;
+    private static final int VERSION = 1;
 
     private final ConcurrentHashMap<String, byte[]> cache = new ConcurrentHashMap<>();
     private final AtomicLong hits = new AtomicLong();
@@ -55,6 +69,58 @@ public final class DecompilationCache {
         misses.set(0);
         compressedBytes.set(0);
         originalBytes.set(0);
+    }
+
+    /**
+     * Serialize the compressed source cache to {@code file} (key + already-Deflated bytes), so a
+     * restart can reload pre-decompiled source instead of re-decompiling on the first search.
+     */
+    public void save(Path file) throws IOException {
+        Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+        if (file.getParent() != null) Files.createDirectories(file.getParent());
+        try (OutputStream fos = Files.newOutputStream(tmp);
+             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(fos))) {
+            out.writeInt(MAGIC);
+            out.writeInt(VERSION);
+            out.writeInt(cache.size());
+            for (Map.Entry<String, byte[]> e : cache.entrySet()) {
+                byte[] kb = e.getKey().getBytes(StandardCharsets.UTF_8);
+                out.writeInt(kb.length);
+                out.write(kb);
+                byte[] v = e.getValue();
+                out.writeInt(v.length);
+                out.write(v);
+            }
+        }
+        Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** Reload a cache written by {@link #save}, populating the in-memory map. Returns false on mismatch. */
+    public boolean load(Path file) {
+        if (!Files.isReadable(file)) return false;
+        try (InputStream fis = Files.newInputStream(file);
+             DataInputStream in = new DataInputStream(new BufferedInputStream(fis))) {
+            if (in.readInt() != MAGIC || in.readInt() != VERSION) return false;
+            int n = in.readInt();
+            if (n < 0 || n > 5_000_000) return false;
+            long comp = 0;
+            for (int i = 0; i < n; i++) {
+                int kl = in.readInt();
+                if (kl < 0 || kl > (1 << 24)) return false;
+                byte[] kb = new byte[kl];
+                in.readFully(kb);
+                int vl = in.readInt();
+                if (vl < 0 || vl > (1 << 28)) return false;
+                byte[] v = new byte[vl];
+                in.readFully(v);
+                cache.put(new String(kb, StandardCharsets.UTF_8), v);
+                comp += vl;
+            }
+            compressedBytes.addAndGet(comp);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     public Map<String, Object> stats() {

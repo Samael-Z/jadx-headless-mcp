@@ -5,6 +5,8 @@ import com.zin.jadxheadless.util.RenameStore;
 import com.zin.jadxheadless.util.StringIndex;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
+import jadx.core.dex.instructions.args.ArgType;
+import jadx.core.dex.nodes.ClassNode;
 import jadx.api.data.ICodeRename;
 import jadx.api.data.IJavaNodeRef;
 import jadx.api.data.impl.JadxCodeData;
@@ -27,6 +29,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -53,13 +58,12 @@ public final class BridgeContext {
     private final RenameStore renameStore = new RenameStore();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
-    /** Cap on classes decompiled into the code index (full-corpus decompile is infeasible). */
-    private static final int MAX_CODE_INDEX_CLASSES = 25_000;
-
     /** Cached, lazily computed snapshot of all classes including inner classes. */
     private volatile List<JavaClass> classesWithInners;
     /** Lazy FQN -> JavaClass index for O(1) lookups by name. */
     private volatile Map<String, JavaClass> classByFqn;
+    /** Lazy supertype-FQN -> direct-subtype-FQNs index, built once from the jadx model (model-only, cheap). */
+    private volatile Map<String, List<String>> subtypeIndex;
     /**
      * Lazy raw-name -> JavaClass index. The raw name is the original DEX class
      * name (e.g. {@code X.1C8X}) BEFORE jadx's built-in deobfuscator mangles
@@ -100,56 +104,146 @@ public final class BridgeContext {
     }
 
     /**
-     * Kick off the const-string inverted index build in the background (space-for-time).
-     * Tries to load a persisted index next to the APK first; only rebuilds (and re-persists)
-     * when absent/stale. Non-blocking: until the index is READY, find-string-usages falls
-     * back to the bounded live scan. Safe to call once after the server is listening.
+     * Kick off the background PRE-DECOMPILE pass (space-for-time). Tries to load a persisted Java
+     * index ({@code .jidx}) next to the APK first; only rebuilds when absent/stale. Non-blocking:
+     * until the index is READY, code/keyword searches fall back to a bounded live scan. The pass
+     * decompiles classes (main-package first) under a wall-clock budget + a heap-headroom guardrail,
+     * indexing each into {@link StringIndex} as it goes, then persists the index. Safe to call once
+     * after the server is listening.
+     *
+     * @param budgetMs wall-clock budget for the decompile pass (e.g. 300_000 = 5 min)
      */
-    public void startStringIndexBuild() {
+    public void startPreDecompile(long budgetMs) {
         Thread t = new Thread(() -> {
             try {
-                Path idxFile = stringIndexFile();
+                Path idxFile = javaIndexFile();
                 if (idxFile != null && stringIndex.load(idxFile)) {
-                    // smali/method/field/type/call indexes reused from disk; still ensure the code index below
-                } else {
-                    logger.info("[string-index] building (no valid cache at {})", idxFile);
-                    stringIndex.build(getClassesWithInners(), BridgeContext::safeSmali);
-                    if (idxFile != null && stringIndex.status() == StringIndex.Status.READY) {
-                        try {
-                            stringIndex.save(idxFile);
-                            logger.info("[string-index] persisted to {}", idxFile);
-                        } catch (Exception e) {
-                            logger.warn("[string-index] persist failed (in-memory index still active): {}", e.toString());
-                        }
+                    Path srcFile = javaSrcFile();
+                    if (srcFile != null && cache.load(srcFile)) {
+                        logger.info("[pre-decompile] loaded persisted Java index + source cache from disk (restart is fully warm)");
+                    } else {
+                        logger.info("[pre-decompile] loaded persisted Java index from {} (no source cache; first searches re-decompile candidates)", idxFile);
+                    }
+                    return;
+                }
+                logger.info("[pre-decompile] building (no valid index at {}), budget={}ms", idxFile, budgetMs);
+                preDecompileAndIndex(budgetMs);
+                if (idxFile != null && stringIndex.codeIndexReady()) {
+                    try {
+                        stringIndex.save(idxFile);
+                        Path srcFile = javaSrcFile();
+                        if (srcFile != null) cache.save(srcFile);
+                        logger.info("[pre-decompile] persisted index + source cache to disk");
+                    } catch (Exception e) {
+                        logger.warn("[pre-decompile] persist failed (in-memory index still active): {}", e.toString());
                     }
                 }
-                // Code-identifier index (decompile-based, main-package only). Separate file, best-effort.
-                if (stringIndex.status() == StringIndex.Status.READY) {
-                    buildOrLoadCodeIndex();
-                }
             } catch (Throwable t2) {
-                logger.warn("[string-index] background build error: {}", t2.toString());
+                logger.warn("[pre-decompile] background error: {}", t2.toString());
             }
-        }, "string-index-builder");
+        }, "pre-decompile");
         t.setDaemon(true);
-        // Slightly below normal so live request handling stays responsive during the build.
+        // Slightly below normal so live request handling stays responsive during the pass.
         try { t.setPriority(Thread.NORM_PRIORITY - 1); } catch (Throwable ignored) {}
         t.start();
     }
 
-    /** Persisted string-index location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.stridx}). */
-    private Path stringIndexFile() {
-        return cacheFile(".stridx");
+    /**
+     * Decompile classes (main-package first, then the rest) under a time budget + heap-headroom guard,
+     * feeding each class's source into the decompilation cache AND the Java inverted index. Stops early
+     * and records why ({@code budget_exhausted} / {@code mem_stopped}); a clean finish sets
+     * {@code coverage_complete=true}. Parallelism is bounded to cap peak memory on huge APKs.
+     */
+    private void preDecompileAndIndex(long budgetMs) {
+        List<JavaClass> all = getClassesWithInners();
+        String pkg = manifestPackageName();
+        List<JavaClass> main = new ArrayList<>();
+        List<JavaClass> rest = new ArrayList<>();
+        if (pkg == null || pkg.isEmpty()) {
+            rest.addAll(all);
+        } else {
+            String prefix = pkg + ".";
+            for (JavaClass c : all) {
+                String fqn = c.getFullName();
+                if (fqn.startsWith(prefix) || fqn.equals(pkg)) main.add(c); else rest.add(c);
+            }
+        }
+        stringIndex.beginBuild(all.size(), budgetMs);
+        long deadline = System.nanoTime() + budgetMs * 1_000_000L;
+        AtomicBoolean budgetHit = new AtomicBoolean(false);
+        AtomicBoolean memHit = new AtomicBoolean(false);
+        AtomicBoolean stop = new AtomicBoolean(false);
+        AtomicInteger processed = new AtomicInteger();
+        // Bounded parallelism: half the cores (>=2). Caps in-flight decompiles — the driver of peak
+        // heap + native commit on a huge APK (full availableProcessors() OOM-killed Douyin).
+        int par = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        ForkJoinPool pool = new ForkJoinPool(par);
+        try {
+            runDecompilePass(pool, main, deadline, budgetHit, memHit, stop, processed);
+            if (!stop.get()) {
+                runDecompilePass(pool, rest, deadline, budgetHit, memHit, stop, processed);
+            }
+        } catch (Throwable t) {
+            logger.warn("[pre-decompile] pass error: {}", t.toString());
+        } finally {
+            pool.shutdown();
+        }
+        boolean complete = !budgetHit.get() && !memHit.get();
+        stringIndex.finishBuild(budgetHit.get(), memHit.get(), complete);
+    }
+
+    /** One bounded-parallel decompile+index pass over {@code classes}; flips stop/budget/mem flags. */
+    private void runDecompilePass(ForkJoinPool pool, List<JavaClass> classes, long deadline,
+                                  AtomicBoolean budgetHit, AtomicBoolean memHit,
+                                  AtomicBoolean stop, AtomicInteger processed) throws Exception {
+        if (classes.isEmpty()) return;
+        pool.submit(() -> classes.parallelStream().forEach(c -> {
+            if (stop.get()) return;
+            if (System.nanoTime() > deadline) { budgetHit.set(true); stop.set(true); return; }
+            if ((processed.get() & 0x3FF) == 0 && lowHeap()) { memHit.set(true); stop.set(true); return; }
+            String fqn;
+            String code = null;
+            try {
+                fqn = c.getFullName();
+                code = cache.get(fqn);
+                if (code == null) {
+                    code = c.getCode();
+                    if (code != null) cache.put(fqn, code);
+                }
+            } catch (Throwable t) {
+                fqn = safeFullName(c);
+            }
+            stringIndex.indexClass(fqn, code);
+            int n = processed.incrementAndGet();
+            if ((n & 0x1FFF) == 0) logger.info("[pre-decompile] {} classes decompiled+indexed", n);
+        })).get();
+    }
+
+    /** True when free heap headroom drops below ~1/8 of -Xmx — stop the pass best-effort before OOM. */
+    private static boolean lowHeap() {
+        Runtime rt = Runtime.getRuntime();
+        long max = rt.maxMemory();
+        long used = rt.totalMemory() - rt.freeMemory();
+        return (max - used) < (max / 8);
+    }
+
+    private static String safeFullName(JavaClass c) {
+        try { return c.getFullName(); } catch (Throwable t) { return "?"; }
+    }
+
+    /** Persisted Java-source inverted index ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.jidx}). */
+    private Path javaIndexFile() {
+        return cacheFile(".jidx");
+    }
+
+    /** Persisted decompiled-source cache ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.jsrc}). */
+    private Path javaSrcFile() {
+        return cacheFile(".jsrc");
     }
 
     /** Persisted user-rename journal location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.renames.json}). */
     private Path renameStoreFile() {
         return cacheFile(".renames.json");
-    }
-
-    /** Persisted code-identifier index location ({@code <apk-dir>/.jadx-mcp-cache/<name>.<size>.codeidx}). */
-    private Path codeIndexFile() {
-        return cacheFile(".codeidx");
     }
 
     /**
@@ -169,58 +263,6 @@ public final class BridgeContext {
             return new File(dir, apkFile.getName() + "." + apkFile.length() + suffix).toPath();
         } catch (Throwable t) {
             return null;
-        }
-    }
-
-    /**
-     * Load or build the code-identifier index for the main-package subset (best-effort, separate
-     * .codeidx file). Decompile is expensive, so this is capped at {@link #MAX_CODE_INDEX_CLASSES}
-     * and runs on the same low-priority background thread as the smali index.
-     */
-    private void buildOrLoadCodeIndex() {
-        Path codeFile = codeIndexFile();
-        try {
-            if (codeFile != null && stringIndex.loadCodeIndex(codeFile)) return;
-            String pkg = manifestPackageName();
-            if (pkg == null || pkg.isEmpty()) {
-                logger.info("[code-index] skipped (no manifest package)");
-                return;
-            }
-            List<JavaClass> mainClasses = new ArrayList<>();
-            for (JavaClass c : getClassesWithInners()) {
-                String fqn = c.getFullName();
-                if (fqn.startsWith(pkg + ".") || fqn.equals(pkg)) {
-                    mainClasses.add(c);
-                    if (mainClasses.size() >= MAX_CODE_INDEX_CLASSES) break;
-                }
-            }
-            if (mainClasses.isEmpty()) {
-                logger.info("[code-index] skipped (no classes under package {})", pkg);
-                return;
-            }
-            logger.info("[code-index] building over {} main-package classes (pkg={}, cap={})",
-                    mainClasses.size(), pkg, MAX_CODE_INDEX_CLASSES);
-            stringIndex.buildCodeIndex(mainClasses, c -> {
-                try {
-                    String cached = cache.get(c.getFullName());
-                    if (cached != null) return cached;
-                    String code = c.getCode();
-                    if (code != null) cache.put(c.getFullName(), code);
-                    return code;
-                } catch (Throwable t) {
-                    return null;
-                }
-            });
-            if (codeFile != null && stringIndex.codeIndexReady()) {
-                try {
-                    stringIndex.saveCodeIndex(codeFile);
-                    logger.info("[code-index] persisted to {}", codeFile);
-                } catch (Exception e) {
-                    logger.warn("[code-index] persist failed (in-memory code index still active): {}", e.toString());
-                }
-            }
-        } catch (Throwable t) {
-            logger.warn("[code-index] build error: {}", t.toString());
         }
     }
 
@@ -328,15 +370,6 @@ public final class BridgeContext {
         }
     }
 
-    /** Wrap {@code getSmali()} -- never throw during the index build. */
-    static String safeSmali(JavaClass c) {
-        try {
-            return c.getSmali();
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
     /** All classes including inner classes. Cached after first call. */
     public List<JavaClass> getClassesWithInners() {
         List<JavaClass> local = classesWithInners;
@@ -350,6 +383,63 @@ public final class BridgeContext {
             }
         }
         return local;
+    }
+
+    /**
+     * Lazily-built type-hierarchy index: supertype FQN -> list of its DIRECT subtype FQNs
+     * (subclasses AND interface implementors), derived purely from the jadx model
+     * ({@link ClassNode#getSuperClass()} + {@link ClassNode#getInterfaces()}). Model-only and cheap
+     * — no decompilation — so it does NOT consume the pre-decompile budget. Keys are the resolved
+     * dotted FQNs as the model sees them (e.g. {@code android.app.Activity}); these match the FQNs
+     * in decompiled source for SDK/framework and un-obfuscated base classes. Built once and cached.
+     */
+    public Map<String, List<String>> subtypeIndex() {
+        Map<String, List<String>> local = subtypeIndex;
+        if (local != null) return local;
+        synchronized (this) {
+            if (subtypeIndex != null) return subtypeIndex;
+            Map<String, List<String>> map = new HashMap<>();
+            for (JavaClass c : getClassesWithInners()) {
+                String sub;
+                ClassNode node;
+                try {
+                    sub = c.getFullName();
+                    node = c.getClassNode();
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (node == null) continue;
+                try {
+                    String superFqn = argTypeFqn(node.getSuperClass());
+                    if (superFqn != null && !superFqn.equals("java.lang.Object")) {
+                        map.computeIfAbsent(superFqn, k -> new ArrayList<>()).add(sub);
+                    }
+                    List<ArgType> ifaces = node.getInterfaces();
+                    if (ifaces != null) {
+                        for (ArgType it : ifaces) {
+                            String ifaceFqn = argTypeFqn(it);
+                            if (ifaceFqn != null) {
+                                map.computeIfAbsent(ifaceFqn, k -> new ArrayList<>()).add(sub);
+                            }
+                        }
+                    }
+                } catch (Throwable t) {
+                    // skip a class whose hierarchy can't be read
+                }
+            }
+            subtypeIndex = map;
+            return map;
+        }
+    }
+
+    /** Dotted FQN of an object {@link ArgType}, or null for primitives/arrays/null/unresolved. */
+    private static String argTypeFqn(ArgType t) {
+        if (t == null) return null;
+        try {
+            return t.isObject() ? t.getObject() : null;
+        } catch (Throwable e) {
+            return null;
+        }
     }
 
     /**
@@ -418,9 +508,10 @@ public final class BridgeContext {
         }
     }
 
-    /** Drop the FQN/raw-name indexes (e.g. after a bulk rename). Class list itself is unaffected. */
+    /** Drop the FQN/raw-name + subtype indexes (e.g. after a bulk rename). Class list itself is unaffected. */
     public void invalidateClassIndex() {
         classByFqn = null;
         classByRawName = null;
+        subtypeIndex = null;
     }
 }
