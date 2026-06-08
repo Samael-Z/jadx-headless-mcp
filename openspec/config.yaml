@@ -1,0 +1,27 @@
+schema: spec-driven
+
+# Project context shown to AI when creating/refining artifacts.
+context: |
+  Project: jadx-headless-mcp-v2 — a single-process, headless jadx decompiler + MCP server
+  for reverse-engineering large Android apps (Douyin-scale) under a 20 GB heap, ≤60s per tool call.
+
+  Tech stack: Java 17 (Maven, shaded fat jar). Depends on published jadx 1.5.5 artifacts
+  (io.github.skylot:jadx-core / jadx-dex-input / jadx-kotlin-metadata + input plugins), the official
+  MCP Java SDK 1.1.x (Streamable HTTP, embedded Jetty 12 EE10), and sqlite-jdbc 3.45 (FTS5 trigram).
+
+  Layers: jadx/ (headless core: load, bounded+disk code cache, custom IUsageInfoCache),
+  index/ (SQLite symbol+edge graph + FTS5 + streaming/resumable IndexBuilder),
+  mcp/ (Streamable HTTP server + 32-tool registry), util/ (cache layout, dex-stable ids, JSON, rename journal).
+
+  Key decisions (see changes/headless-jadx-mcp/design.md): D1 single-process Java + official MCP SDK
+  Streamable HTTP, localhost no-auth; D2 resident+lazy, bounded/disk code cache; D4 source-name ALWAYS
+  + kotlin-metadata, deobf off by default; D5 dex-stable index keys; D6 SQLite symbol graph + FTS5
+  trigram (ripgrep regex fallback); D7 xref/usage exported to SQLite (out of heap).
+
+  Constraints: do NOT depend on the vendored jadx source tree (use published artifacts). Keep tool calls
+  ≤60s (Tier-1 instant via SQLite; Tier-3 search_in_code is index-backed/background). Stay within -Xmx20g.
+
+# Per-artifact rules (optional)
+# rules:
+#   proposal:
+#     - Always include a "Non-goals" section
