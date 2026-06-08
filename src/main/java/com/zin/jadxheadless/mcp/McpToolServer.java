@@ -44,7 +44,7 @@ public final class McpToolServer {
 						.build();
 
 		mcp = McpServer.sync(transport)
-				.serverInfo("jadx-headless-mcp-v2", "2.0.0")
+				.serverInfo("jadx-headless-mcp-v2", "1.0.0")
 				.capabilities(McpSchema.ServerCapabilities.builder()
 						.tools(true)
 						.build())
