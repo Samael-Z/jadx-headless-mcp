@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [main, v2-java-rewrite]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create a Release on tag pushes
+
+jobs:
+  build:
+    name: build fat jar (JDK 17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # NOTE: deliberately NOT using the repo's settings.xml. That Aliyun mirror only exists to work
+      # around a local proxy's TLS resets; GitHub runners reach Maven Central + Google Maven directly.
+      - name: Build fat jar
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Show artifact
+        run: ls -lh target/jadx-headless-mcp-v2.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jadx-headless-mcp-v2-jar
+          path: target/jadx-headless-mcp-v2.jar
+          retention-days: 14
+
+      - name: Attach jar to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/jadx-headless-mcp-v2.jar
