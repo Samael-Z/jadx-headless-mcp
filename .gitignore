@@ -1,0 +1,18 @@
+# Maven build output
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS / misc
+*.log
+.DS_Store
+hs_err_pid*.log
+
+# JADX cache (generated at runtime; never committed)
+JADX_CACHE_DIR/
