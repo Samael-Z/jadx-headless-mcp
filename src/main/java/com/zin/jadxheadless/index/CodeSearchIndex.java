@@ -233,18 +233,22 @@ public final class CodeSearchIndex {
 		return out;
 	}
 
-	/** Classes that contain a given string literal (exact, or substring when {@code contains}). */
-	public List<Map<String, Object>> findStringUsages(String value, boolean contains, int limit) {
+	/**
+	 * Classes that contain a given <b>exact</b> string literal. For substring / partial matching use
+	 * {@link #searchStringConstants} (FTS-accelerated) — keeping this exact-only makes the two string
+	 * tools orthogonal and avoids the slow {@code LIKE '%...%'} full scan.
+	 */
+	public List<Map<String, Object>> findStringUsages(String value, int limit) {
 		List<Map<String, Object>> out = new ArrayList<>();
 		if (value == null || value.isEmpty()) {
 			return out;
 		}
 		String sql = "SELECT DISTINCT c.fqn, cs.str FROM const_strings cs "
 				+ "LEFT JOIN classes c ON c.cls_idx=cs.cls_idx "
-				+ (contains ? "WHERE cs.str LIKE ?" : "WHERE cs.str = ?") + " LIMIT ?";
+				+ "WHERE cs.str = ? LIMIT ?";
 		synchronized (db.readLock()) {
 			try (PreparedStatement ps = db.conn().prepareStatement(sql)) {
-				ps.setString(1, contains ? "%" + value + "%" : value);
+				ps.setString(1, value);
 				ps.setInt(2, limit);
 				try (ResultSet rs = ps.executeQuery()) {
 					while (rs.next()) {

@@ -254,7 +254,7 @@ single lazy decompile; **Tier-3** is index-backed/background. GUI-only tools (`g
 | Tool | Description |
 |---|---|
 | `search_string_constants` | Substring search over const-string literals → classes |
-| `find_string_usages` | Classes containing a given string literal |
+| `find_string_usages` | Classes containing an **exact** string literal (whole-literal; for substring use `search_string_constants`) |
 | `get_strings` | Android `strings.xml` resources |
 
 ### Xref — out-of-heap SQLite (Tier-1)
@@ -313,6 +313,7 @@ Measured with `-Xmx20g`, AWT-headless, via `--selftest`:
 | Version | Date | Notes |
 |---|---|---|
 | **v1.1.0** | 2026-06-08 | **stdio transport** (`--stdio`): the MCP client (e.g. Claude Code) launches & owns the process; the target APK is loaded at runtime via `load_apk` — HTTP retained as the default. **Fix:** `index_status` now backfills `symbols`/`edges`/`const_strings` when a complete index is reused from disk (it previously reported 0, though the data was always present). |
+| **v1.1.1** | 2026-06-08 | **String-tool cleanup:** `find_string_usages` is now exact-match only (whole-literal); substring search belongs to `search_string_constants` (FTS-accelerated). Drops the overlapping `contains` option and its slow `LIKE` full scan — the two string tools are now orthogonal. |
 | **v1.0.1** | 2026-06-08 | Version alignment; **CI/CD** (GitHub Actions: build the fat jar, upload artifact, attach jar to the Release on `v*` tags). |
 | **v1.0.0** | 2026-06-08 | **Initial release of the single-process Java rewrite.** Out-of-heap SQLite xref, FTS5 trigram code search, bounded/disk code cache, resumable index, official MCP SDK over Streamable HTTP. Validated on DiDi + Douyin within `-Xmx20g`. |
 | `v0.x` | — | Legacy Rust-bridge implementation (recoverable via the `dev` branch and `v0.x` tags). Superseded by v1.0. |

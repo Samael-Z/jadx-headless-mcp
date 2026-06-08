@@ -224,7 +224,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 | 工具 | 说明 |
 |---|---|
 | `search_string_constants` | 在 const-string 字面量里子串搜索 → 类 |
-| `find_string_usages` | 含指定字符串字面量的类 |
+| `find_string_usages` | 含**完整**字符串字面量的类(精确匹配;子串搜索用 `search_string_constants`) |
 | `get_strings` | Android `strings.xml` 资源 |
 
 ### xref —— 出堆 SQLite(Tier-1)
@@ -276,6 +276,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 | 版本 | 日期 | 说明 |
 |---|---|---|
 | **v1.1.0** | 2026-06-08 | **stdio 传输**(`--stdio`):MCP 客户端(如 Claude Code)拉起并持有进程,目标 APK 运行时用 `load_apk` 加载——HTTP 保留为默认。**修复**:`index_status` 在从磁盘复用完整索引时回填 `symbols`/`edges`/`const_strings`(此前显示 0,但数据一直都在)。 |
+| **v1.1.1** | 2026-06-08 | **字符串工具清理:** `find_string_usages` 改为仅精确匹配(完整字面量);子串搜索归 `search_string_constants`(FTS 加速)。移除重叠的 `contains` 选项及其慢速 `LIKE` 全表扫,两个字符串工具职责正交。 |
 | **v1.0.1** | 2026-06-08 | 版本号对齐;**CI/CD**(GitHub Actions:构建 fat jar、上传 artifact、打 `v*` tag 时把 jar 附到 Release)。 |
 | **v1.0.0** | 2026-06-08 | **单进程 Java 重写首个版本。** 出堆 SQLite xref、FTS5 trigram 代码搜索、有界/磁盘 code cache、可恢复索引、官方 MCP SDK over Streamable HTTP。在滴滴 + 抖音上 `-Xmx20g` 内验证。 |
 | `v0.x` | — | 旧的 Rust-bridge 实现(经 `dev` 分支与 `v0.x` tags 可找回)。被 v1.0 取代。 |

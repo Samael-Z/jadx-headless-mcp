@@ -184,14 +184,14 @@ public final class ToolRegistry {
 				}));
 
 		t.add(Tools.tool("find_string_usages",
-				"Classes that contain a given string literal (exact by default; set contains=true for substring).",
-				Tools.schema(Tools.strProp("value", "the string literal") + ","
-						+ Tools.boolProp("contains", "substring match instead of exact (default false)") + ","
+				"Classes that contain an EXACT string literal (whole-literal match). For substring / partial "
+						+ "matching use search_string_constants (FTS-accelerated).",
+				Tools.schema(Tools.strProp("value", "the exact string literal to match in full") + ","
 						+ Tools.intProp("limit", "max results (default 200)"), "value"),
 				args -> {
 					int limit = Pagination.intArg(args, "limit", 200, 1, 2000);
 					List<Map<String, Object>> hits = svc.codeSearch()
-							.findStringUsages(reqStr(args, "value"), boolArg(args, "contains", false), limit);
+							.findStringUsages(reqStr(args, "value"), limit);
 					return withIndexNote(Map.of("count", hits.size(), "usages", hits));
 				}));
 
