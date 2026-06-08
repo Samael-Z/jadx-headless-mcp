@@ -191,6 +191,31 @@ public final class SymbolGraph {
 		}
 	}
 
+	/**
+	 * On-disk row counts (read connection). Used to backfill index_status when a complete index is
+	 * reused from disk — the build-time {@link #symbolCount()} counter is only live during a build,
+	 * so on reuse it would read 0 even though the rows are all present.
+	 */
+	public long countSymbols() {
+		return scalarCount("SELECT COUNT(*) FROM symbols");
+	}
+
+	public long countEdges() {
+		return scalarCount("SELECT COUNT(*) FROM edges");
+	}
+
+	private long scalarCount(String sql) {
+		synchronized (db.readLock()) {
+			try (PreparedStatement ps = db.conn().prepareStatement(sql);
+					ResultSet rs = ps.executeQuery()) {
+				return rs.next() ? rs.getLong(1) : 0L;
+			} catch (SQLException e) {
+				LOG.warn("count query failed ({}): {}", sql, e.toString());
+				return 0L;
+			}
+		}
+	}
+
 	/** Incoming references to a symbol of the given edge type → the source symbols (callers/users). */
 	public List<Map<String, Object>> incoming(int dstId, int type) {
 		return neighbours(dstId, type, true);

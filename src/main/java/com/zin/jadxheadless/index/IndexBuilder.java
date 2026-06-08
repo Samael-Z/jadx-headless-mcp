@@ -84,6 +84,12 @@ public final class IndexBuilder {
 		if (db.isComplete()) {
 			LOG.info("[index] reusing complete index from disk ({} top-level classes)", top.size());
 			status.markReusedComplete(top.size());
+			// Backfill counts from the on-disk index. The build path accumulates these via
+			// addSymbols/addEdges/addStrings; the reuse path skips the build, so without this
+			// index_status would report symbols/edges/const_strings as 0 despite the data being present.
+			status.addSymbols((int) graph.countSymbols());
+			status.addEdges(graph.countEdges());
+			status.addStrings((int) csi.countConstStrings());
 			return;
 		}
 		long start = System.currentTimeMillis();

@@ -135,6 +135,23 @@ public final class CodeSearchIndex {
 	// ==================== query ====================
 
 	/**
+	 * Total const-string rows on disk. Backfills index_status when a complete index is reused — the
+	 * build path counts these incrementally via {@code status.addStrings(...)}, which the reuse path
+	 * skips, so without this the count would read 0 despite the rows being present.
+	 */
+	public long countConstStrings() {
+		synchronized (db.readLock()) {
+			try (Statement st = db.conn().createStatement();
+					ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM const_strings")) {
+				return rs.next() ? rs.getLong(1) : 0L;
+			} catch (SQLException e) {
+				LOG.warn("countConstStrings failed: {}", e.toString());
+				return 0L;
+			}
+		}
+	}
+
+	/**
 	 * Full-text code search. For ordinary substrings (≥3 chars) uses the FTS5 trigram index; for a
 	 * regex request, or sub-trigram queries, falls back to ripgrep over the disk code cache.
 	 * Returns rows of {@code {class, cls_idx}}; caller may attach snippets.
