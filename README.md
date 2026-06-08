@@ -10,7 +10,7 @@
 A **single-process, headless [jadx](https://github.com/skylot/jadx) decompiler + MCP server** built for
 **reverse-engineering large Android apps** (e.g. Douyin: 295 MB / 55 dex) under a **20 GB heap**, with
 **every MCP tool call bounded to ~60 s**. It exposes 32 RE tools to LLM clients over the official
-**Model Context Protocol** (Streamable HTTP).
+**Model Context Protocol** — over **stdio** (client-launched) or **Streamable HTTP**.
 
 > This is the **v1.0 Java rewrite**. It supersedes the earlier Rust-bridge implementation (the `v0.x`
 > tags / `dev` branch), removing the cross-language bridge and the GUI dependency entirely.
@@ -50,7 +50,8 @@ This project is **rebuilt for RE**: load any APK (including Douyin), keep all to
 ## Highlights
 
 - 🧩 **Single JVM, no bridge, no Python.** jadx-core and the MCP server run in one process; MCP speaks
-  **Streamable HTTP** (not the deprecated SSE) via an embedded Jetty, bound to `127.0.0.1`.
+  **stdio** (client-launched, `--stdio`) or **Streamable HTTP** (embedded Jetty on `127.0.0.1`; not the
+  deprecated SSE).
 - 🧠 **Out-of-heap xref.** A custom `IUsageInfoCache` exports jadx's usage graph to **SQLite**
   (symbols + edges); `get_xrefs_*` / `get_call_graph` answer from SQL and never touch jadx's in-heap
   `getUseIn()`. On Douyin that's **4.5 M symbols / 29.5 M edges** off the heap.
@@ -158,11 +159,16 @@ dependencies (jadx-all, Jetty, MCP SDK, sqlite-jdbc) and merges `META-INF/servic
 
 ## Usage
 
-It is a **resident HTTP server**: start it once, then point MCP clients at the endpoint.
+Two transports. **stdio** is simplest when the client launches the process (e.g. Claude Code); **HTTP**
+(the default) is a resident server you start yourself and point clients at.
 
 ```bash
+# HTTP (Streamable HTTP) — a resident server you start; clients connect to the URL
 java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
      --host 127.0.0.1 --port 8650 [--apk <path-to-apk>] [--deobf]
+
+# stdio — the client launches & owns the process; load a target APK at runtime via load_apk
+java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 ```
 
 | Flag | Default | Meaning |
@@ -171,6 +177,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
 | `--port` | `8650` | HTTP port; MCP endpoint is `http://<host>:<port>/mcp` |
 | `--apk` | — | Optional APK/DEX/AAB/XAPK/APKM/JAR to load on startup (or call `load_apk` later) |
 | `--deobf` | off | Enable jadx deobfuscation (off is better for heavily-obfuscated apps) |
+| `--stdio` | — | Speak MCP over stdin/stdout instead of HTTP — for clients that launch the process (e.g. Claude Code `"type": "stdio"`). No port; logs stay on stderr. Load a target APK at runtime via `load_apk`. |
 | `--selftest` | — | Run the headless end-to-end self-test against `--apk` and exit |
 
 - Cache root defaults to `E:\JADX_CACHE_DIR`; override with the `JADX_CACHE_DIR` env var or
@@ -181,7 +188,24 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
 
 ## Connecting an MCP client
 
-The server uses **Streamable HTTP**, so the client connects to a URL (it does not spawn the process):
+**stdio** — the client launches the process (recommended for Claude Code; load the target APK at runtime
+via `load_apk`):
+
+```jsonc
+{
+  "mcpServers": {
+    "jadx-headless-mcp-v2": {
+      "type": "stdio",
+      "command": "java",
+      "args": ["-Xmx20g", "-Djava.awt.headless=true", "-jar",
+               "/abs/path/to/jadx-headless-mcp-v2.jar", "--stdio"]
+    }
+  }
+}
+```
+
+**Streamable HTTP** — start the server yourself (see Usage), then point the client at the URL (it does
+not spawn the process):
 
 ```jsonc
 {
@@ -288,6 +312,7 @@ Measured with `-Xmx20g`, AWT-headless, via `--selftest`:
 
 | Version | Date | Notes |
 |---|---|---|
+| **v1.1.0** | 2026-06-08 | **stdio transport** (`--stdio`): the MCP client (e.g. Claude Code) launches & owns the process; the target APK is loaded at runtime via `load_apk` — HTTP retained as the default. **Fix:** `index_status` now backfills `symbols`/`edges`/`const_strings` when a complete index is reused from disk (it previously reported 0, though the data was always present). |
 | **v1.0.1** | 2026-06-08 | Version alignment; **CI/CD** (GitHub Actions: build the fat jar, upload artifact, attach jar to the Release on `v*` tags). |
 | **v1.0.0** | 2026-06-08 | **Initial release of the single-process Java rewrite.** Out-of-heap SQLite xref, FTS5 trigram code search, bounded/disk code cache, resumable index, official MCP SDK over Streamable HTTP. Validated on DiDi + Douyin within `-Xmx20g`. |
 | `v0.x` | — | Legacy Rust-bridge implementation (recoverable via the `dev` branch and `v0.x` tags). Superseded by v1.0. |

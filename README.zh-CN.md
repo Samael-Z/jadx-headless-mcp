@@ -7,7 +7,7 @@
 
 [English](README.md) · **简体中文**
 
-一个**单进程、无头的 [jadx](https://github.com/skylot/jadx) 反编译器 + MCP 服务**,为**大型 Android 应用的逆向分析(RE)**而生(如抖音:295 MB / 55 dex),在 **20 GB 堆**内运行,**每次 MCP 工具调用 ≤ 60s**。通过官方 **Model Context Protocol**(Streamable HTTP)向 LLM 客户端暴露 32 个 RE 工具。
+一个**单进程、无头的 [jadx](https://github.com/skylot/jadx) 反编译器 + MCP 服务**,为**大型 Android 应用的逆向分析(RE)**而生(如抖音:295 MB / 55 dex),在 **20 GB 堆**内运行,**每次 MCP 工具调用 ≤ 60s**。通过官方 **Model Context Protocol**——**stdio**(客户端拉起)或 **Streamable HTTP**——向 LLM 客户端暴露 32 个 RE 工具。
 
 > 这是 **v1.0 Java 重写版**,取代早期的 Rust-bridge 实现(`v0.x` tags / `dev` 分支),彻底去掉跨语言桥接与 GUI 依赖。
 
@@ -41,7 +41,7 @@
 
 ## 核心特性
 
-- 🧩 **单 JVM,无桥接,无 Python。** jadx-core 与 MCP 服务同进程;MCP 走 **Streamable HTTP**(非弃用的 SSE),内嵌 Jetty,绑 `127.0.0.1`。
+- 🧩 **单 JVM,无桥接,无 Python。** jadx-core 与 MCP 服务同进程;MCP 走 **stdio**(客户端拉起,`--stdio`)或 **Streamable HTTP**(内嵌 Jetty 绑 `127.0.0.1`;非弃用的 SSE)。
 - 🧠 **xref 出堆。** 自定义 `IUsageInfoCache` 把 jadx 的 usage 图导出到 **SQLite**(符号 + 边);`get_xrefs_*` / `get_call_graph` 全查 SQL,从不碰堆内 `getUseIn()`。抖音上是 **456 万符号 / 2950 万边**全部出堆。
 - 🔎 **索引化代码搜索。** `search_in_code` 用 **SQLite FTS5 trigram** 索引反编译文本(完整正则用 **ripgrep** 兜底),查询不再全量重扫。
 - 💾 **有界 + 磁盘 code cache。** 有界堆内 LRU 套磁盘缓存,取代 jadx 无界的 `InMemoryCodeCache`,长会话堆占用不无限增长;跨重启复用。
@@ -136,11 +136,15 @@ mvn -s settings.xml package          # → target/jadx-headless-mcp-v2.jar(~68 M
 
 ## 使用
 
-它是一个**常驻 HTTP 服务**:起一次,然后让 MCP 客户端连端点。
+两种传输。客户端能拉起进程时(如 Claude Code)用 **stdio** 最简单;**HTTP**(默认)是你自己起的常驻服务,客户端连它。
 
 ```bash
+# HTTP(Streamable HTTP)——你自己起的常驻服务,客户端连 URL
 java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
      --host 127.0.0.1 --port 8650 [--apk <apk路径>] [--deobf]
+
+# stdio——客户端拉起并持有进程;目标 APK 运行时用 load_apk 加载
+java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 ```
 
 | 参数 | 默认 | 含义 |
@@ -149,6 +153,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
 | `--port` | `8650` | HTTP 端口;MCP 端点是 `http://<host>:<port>/mcp` |
 | `--apk` | — | 启动时加载的 APK/DEX/AAB/XAPK/APKM/JAR(也可之后调 `load_apk`) |
 | `--deobf` | 关 | 开 jadx deobf(重混淆 app 建议关) |
+| `--stdio` | — | 用 stdin/stdout 跑 MCP(而非 HTTP)——给会拉起进程的客户端(如 Claude Code `"type": "stdio"`)。无端口;日志走 stderr。目标 APK 运行时用 `load_apk` 加载。 |
 | `--selftest` | — | 对 `--apk` 跑无头端到端自检后退出 |
 
 - 缓存根默认 `E:\JADX_CACHE_DIR`;用环境变量 `JADX_CACHE_DIR` 或 `-Djadx.cache.dir=...` 覆盖。
@@ -158,7 +163,22 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
 
 ## 接入 MCP 客户端
 
-服务走 **Streamable HTTP**,客户端连 URL(不会拉起进程):
+**stdio**——客户端拉起进程(Claude Code 推荐;目标 APK 运行时用 `load_apk` 加载):
+
+```jsonc
+{
+  "mcpServers": {
+    "jadx-headless-mcp-v2": {
+      "type": "stdio",
+      "command": "java",
+      "args": ["-Xmx20g", "-Djava.awt.headless=true", "-jar",
+               "/abs/path/to/jadx-headless-mcp-v2.jar", "--stdio"]
+    }
+  }
+}
+```
+
+**Streamable HTTP**——你自己起服务(见"使用"),再把客户端指向 URL(不会拉起进程):
 
 ```jsonc
 {
@@ -255,6 +275,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar \
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| **v1.1.0** | 2026-06-08 | **stdio 传输**(`--stdio`):MCP 客户端(如 Claude Code)拉起并持有进程,目标 APK 运行时用 `load_apk` 加载——HTTP 保留为默认。**修复**:`index_status` 在从磁盘复用完整索引时回填 `symbols`/`edges`/`const_strings`(此前显示 0,但数据一直都在)。 |
 | **v1.0.1** | 2026-06-08 | 版本号对齐;**CI/CD**(GitHub Actions:构建 fat jar、上传 artifact、打 `v*` tag 时把 jar 附到 Release)。 |
 | **v1.0.0** | 2026-06-08 | **单进程 Java 重写首个版本。** 出堆 SQLite xref、FTS5 trigram 代码搜索、有界/磁盘 code cache、可恢复索引、官方 MCP SDK over Streamable HTTP。在滴滴 + 抖音上 `-Xmx20g` 内验证。 |
 | `v0.x` | — | 旧的 Rust-bridge 实现(经 `dev` 分支与 `v0.x` tags 可找回)。被 v1.0 取代。 |
