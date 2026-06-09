@@ -43,10 +43,11 @@
 
 - 🧩 **单 JVM,无桥接,无 Python。** jadx-core 与 MCP 服务同进程;MCP 走 **stdio**(客户端拉起,`--stdio`)或 **Streamable HTTP**(内嵌 Jetty 绑 `127.0.0.1`;非弃用的 SSE)。
 - 🧠 **xref 出堆。** 自定义 `IUsageInfoCache` 把 jadx 的 usage 图导出到 **SQLite**(符号 + 边);`get_xrefs_*` / `get_call_graph` 全查 SQL,从不碰堆内 `getUseIn()`。抖音上是 **456 万符号 / 2950 万边**全部出堆。
-- 🔎 **索引化代码搜索。** `search_in_code` 用 **SQLite FTS5 trigram** 索引反编译文本(完整正则用 **ripgrep** 兜底),查询不再全量重扫。
+- 🔎 **分析价值导向的代码搜索。** `search_in_code` 用 **SQLite FTS5 trigram** 索引反编译文本(完整正则用 **ripgrep** 兜底)。结果按类聚合(每类一条)、**默认过滤标准库**、按 **app > 混淆 > 具名三方** 排序;索引本身也是选择性的(默认跳标准库,`--index-all` 索引全部)。
 - 💾 **有界 + 磁盘 code cache。** 有界堆内 LRU 套磁盘缓存,取代 jadx 无界的 `InMemoryCodeCache`,长会话堆占用不无限增长;跨重启复用。
 - 🏷️ **dex 稳定键。** 索引以原始 DEX 描述符为键,改命名设置 / 改名都不会让结构索引失效,只刷新显示名层。
-- 🔁 **可恢复的流式构建。** 索引后台构建并报进度(`index_status`);部分构建仍可搜,**下次加载续建扩展覆盖**。
+- 🪜 **分层渐进可用。** `load_apk` 在模型加载完即返回;索引随后**按分析价值**分层构建——xref 图谱 → manifest **入口**类 → app **主包** → 其余——所以最相关的代码在数秒内即可搜,远早于全量完成。`index_status` 报 `current_tier` / `xref_ready` / `main_ready` 及 `decompiled_classes` 对 `indexed_classes`。构建期间 `search_in_code` 透明覆盖**所有已反编译的类**(FTS ∪ 对反编译源码的 ripgrep 扫描),部分结果不会漏掉任何已反编译的类。
+- 🔁 **可恢复的流式构建。** 索引后台构建并报进度(`index_status`);部分构建仍可搜,**下次加载续建扩展覆盖**(tier 就绪标志从落盘产物恢复)。
 - 📛 **默认可读名字。** `useSourceNameAsClassNameAlias=ALWAYS` + kotlin-metadata;`deobf` **默认关**(对重混淆 app 反而退化包名)。
 
 ## 架构
@@ -116,7 +117,7 @@ jadx-headless-mcp/                    (main 分支 = Java 重写版)
 
 - **JDK 17+**(Jetty 12 与 MCP SDK 需要 17;jadx 制品是 Java 11 字节码,向前兼容)。
 - 从源码构建需 **Maven 3.9+**。
-- 堆:大型 app 用 `-Xmx20g`(小 app 更省)。`ripgrep`(`rg`)在 `PATH` 上是可选的(启用 `search_in_code` 的正则兜底)。
+- 堆:大型 app 用 `-Xmx20g`(小 app 更省)。`ripgrep`(`rg`)在 `PATH` 上**强烈建议**安装:它既驱动正则兜底,又在索引构建期间提供跨相扫描——让 `search_in_code` 覆盖"已反编译但尚未进 FTS"的类;若缺失,构建期的代码搜索只能限于 FTS 已索引子集,直到 `coverage_complete`。
 
 ## 安装 / 构建
 
@@ -155,6 +156,11 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 | `--deobf` | 关 | 开 jadx deobf(重混淆 app 建议关) |
 | `--stdio` | — | 用 stdin/stdout 跑 MCP(而非 HTTP)——给会拉起进程的客户端(如 Claude Code `"type": "stdio"`)。无端口;日志走 stderr。目标 APK 运行时用 `load_apk` 加载。 |
 | `--selftest` | — | 对 `--apk` 跑无头端到端自检后退出 |
+| `--index-include <pkg,…>` | — | 强制把这些包前缀纳入代码搜索索引(即便会被判为标准库),并按 app 代码排序 |
+| `--index-exclude <pkg,…>` | — | 把这些包前缀从代码搜索索引中跳过 |
+| `--index-all` | 关 | 索引**全部**类(含标准库)——覆盖默认的分析价值范围(见下) |
+| `--no-index-third-party` | 关 | 额外跳过 **T3** 具名三方库(只索引 T1 app + T2 混淆)——三方多的 app 的通用减量开关;T4 标准库无论如何都跳 |
+| `--bench-decompile` | — | spike 模式:测纯全质量反编译地板(3 趟:仅反编译 / +磁盘 / +分片FTS)后退出。`--limit N`(默认 20000)/ `--threads M`(默认核数)。 |
 
 - 缓存根默认 `E:\JADX_CACHE_DIR`;用环境变量 `JADX_CACHE_DIR` 或 `-Djadx.cache.dir=...` 覆盖。
 - 自检(不需要 MCP 客户端):
@@ -202,7 +208,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 |---|---|
 | `load_apk` | 加载/切换 APK;启动后台索引构建 |
 | `current_apk` | 当前 APK + 类数 + 索引状态 |
-| `index_status` | 后台构建进度(percent / coverage_complete / symbols / edges) |
+| `index_status` | 分层构建进度:`current_tier` / `xref_ready` / `main_ready` / `decompiled_classes` 对 `indexed_classes` / `percent` / `coverage_complete` / symbols / edges |
 | `clear_cache` | 清堆内缓存(磁盘索引保留) |
 
 ### 结构枚举(Tier-1)
@@ -223,8 +229,8 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 ### 字符串 —— RE 主力(Tier-1)
 | 工具 | 说明 |
 |---|---|
-| `search_string_constants` | 在 const-string 字面量里子串搜索 → 类 |
-| `find_string_usages` | 含**完整**字符串字面量的类(精确匹配;子串搜索用 `search_string_constants`) |
+| `search_string_constants` | 在 const-string 字面量里子串搜索,**按类聚合**;默认过滤标准库 + 排序(`include_libs` 纳回) |
+| `find_string_usages` | 含**完整**字符串字面量的类(精确匹配;子串搜索用 `search_string_constants`);默认过滤标准库(`include_libs`) |
 | `get_strings` | Android `strings.xml` 资源 |
 
 ### xref —— 出堆 SQLite(Tier-1)
@@ -254,7 +260,7 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 ### 代码 & 名字搜索
 | 工具 | 说明 |
 |---|---|
-| `search_in_code` | 全文(FTS5 trigram;正则走 ripgrep)——Tier-3,索引支撑 |
+| `search_in_code` | 全文(FTS5 trigram;正则走 ripgrep)——Tier-3,索引支撑。每类一条、**默认过滤标准库 + 按 app > 混淆 > 三方 排序**;带 `scope`(包子树)+ `include_libs` 参数 |
 | `search_classes_by_keyword` | 含关键字的类 FQN(瞬时) |
 | `search_method_by_name` | 按方法名子串(model 扫描,有上限) |
 
@@ -268,13 +274,18 @@ java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar --stdio
 | 抖音 295 MB | 493,376 | 125 s | 4,564,540 符号 / **2950 万边** | **18.3–19.1 GB** |
 
 - **抖音上加载 + 完整出堆 xref 图谱在 20 GB 内**,类源码 / 字符串 / xref / manifest / MCP-over-HTTP 都正确且快——这条 RE 主力链路从第一次加载即完整。
-- **`search_in_code` 增量构建。** 为喂 FTS 索引把*每个类*都反编译,比加载重得多——jadx 会累积逐类内部状态,所以单个 20 GB pass 覆盖数万类(main package 优先,即 app 自身代码)后触低堆守护停下。索引对已覆盖子集保持 **READY/可搜**(`coverage_complete=false`),**重新加载同一 APK 会续建**——跳过 structure/usage 阶段和已索引类、继续扩展覆盖。多次加载逼近全量,或调高 `-Xmx`。
-- 磁盘 code cache + SQLite 索引**跨重启复用**(同 APK 哈希)。完整索引会瞬时挂载、不重建。
+- **`search_in_code` 分析价值导向。** 默认只反编译/索引有 RE 价值的代码——app 自身 + 混淆包(T1/T2),**跳过标准库**(`android`/`androidx`/`java`/`kotlin`/`com.google`/…;T4)。结果**按类聚合(每类一条)**、**默认过滤标准库命中**、按 **app > 混淆 > 三方** 排序(`limit` 在排序后施加)。用 `scope` 限包子树、`include_libs=true` 纳回标准库,或 `--index-all` 索引全部。
+- **内存有界的流式构建。** 每个类反编译后**分块**释放(并行反编译 → barrier → 串行释放):`unload()` 释放反编译 IR(逐类累积大头)+ `ConstStorage.removeForClass` 释放 const 条目,使峰值堆有界。**单轮 20GB 即覆盖全部价值类**(抖音 312,498 类 / 峰值 19.3GB);低堆守护仍为 `--index-all`/更大包保证"续建不 OOM"(`coverage_complete=false` + 重载扩展)。磁盘 code cache + SQLite 索引**跨重启复用**(同 APK 哈希),完整索引瞬时挂载、不重建。
+- **多核构建流水线(v1.3.0)。** 反编译线程只反编译 + 抽字符串字面量,把文本投入有界队列;**M 个 FTS 分片写线程**(`fts/shard-<i>.db`,按 `clsIdx % M` 路由)并行分词 + 插入——消除单库 FTS 串行瓶颈。图索引在结构+usage bulk load **之后**一次性建(非逐条)。可调:`JADX_INDEX_SHARDS`(M,默认 8)、`JADX_INDEX_THREADS`(反编译并行,默认核数)、`JADX_INDEX_CHUNK`(默认 4000)、`JADX_INDEX_QUEUE_MB`(队列字节上限,默认 64)、`JADX_INDEX_OVERLAP=1`(usage 导出与代码 phase 并发——默认关,会把峰值堆推向 20GB 上限)。反编译质量**不变**(全质量 AUTO/RESTRUCTURE + source-name + kotlin-metadata):提速纯靠并行/解耦,绝不降级,故 `get_class_source` 输出逐字节一致。**诚实上限**:构建只能逼近纯反编译 CPU 地板——`--bench-decompile` 实测 **22 核全质量 ~228 类/s**,即抖音 312k 类约 ~23min。更快只能加核(线性)或减类(`--no-index-third-party`),没有软件魔法。
+- **分层渐进可用(v1.4.0)。** 既然全量构建是不可压缩的 CPU 绑定任务,就把构建**按分析价值**排序,而非只追"更快全部完成":xref 图谱(不依赖反编译,最先就绪)→ manifest **入口**类 → app **主包** → 其余。每层翻转一个就绪标志(`xref_ready` / `entry_ready` / `main_ready`,配 `current_tier`),最相关的代码数秒内即可搜。构建期间 `search_in_code` 把 FTS 与对反编译 `.java` 的 ripgrep 扫描合并——覆盖**所有已反编译的类**(不止 FTS 已索引子集);`coverage_complete` 后仅走 FTS(亚秒)。工具签名/语义不变——调用方无需感知构建阶段,`index_note` 报当前覆盖。**这不缩短总构建时间**——只改"可用性曲线"。
 
 ## 版本迭代记录
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| **v1.4.0** | 2026-06-09 | **分层渐进可用。** `load_apk` 模型加载完即返回;后台索引改为**按分析价值分层**构建——xref → manifest **入口**类 → app **主包** → 其余——高价值代码数秒内可搜,而非等到 100%。`index_status` 新增 `current_tier` / `xref_ready` / `entry_ready` / `main_ready` 及 `decompiled_classes` 对 `indexed_classes`。构建期间 `search_in_code` 透明覆盖**所有已反编译的类**(FTS ∪ 对反编译源码的 ripgrep),`rg` 缺失时退回 FTS 已索引子集(带 note);`coverage_complete` 后仅走 FTS。tier 就绪标志在重载时从落盘产物恢复。**总构建时间不变**(仍 ≤20GB、全质量 RESTRUCTURE、跨会话续建)——只改"可用性曲线";反编译并行度刻意不动。 |
+| **v1.3.0** | 2026-06-09 | **多核快速索引构建。** 构建改为解耦流水线:反编译线程只反编译 + 抽字面量 → 有界队列 → **M 个并行 FTS 分片写线程**(`fts/shard-<i>.db`,按 `clsIdx % M` 路由),消除单 SQLite-writer 的 trigram 串行瓶颈。`search_in_code` / 字符串搜索跨分片 fan-out + 合并(结果语义不变)。图索引在 bulk load **之后**一次性建(非逐条)。新增 `--no-index-third-party`(跳 T3);env 旋钮 `JADX_INDEX_SHARDS`/`THREADS`/`QUEUE_MB`/`OVERLAP`。schema 升到 **v2**(旧索引自动重建;反编译 code cache 保留)。**反编译质量不变**——纯并行,无 `simple`/`fallback` 降级。`--bench-decompile` spike 钉死诚实上限:全质量反编译地板 **22 核 ~228 类/s**(抖音 312k 约 ~23min),故构建逼近该地板而非某个臆想目标。 |
+| **v1.2.0** | 2026-06-08 | **分析价值导向的代码搜索。** `search_in_code` / `search_string_constants` / `find_string_usages` 现在**按类聚合(每类一条)**、**默认过滤标准库命中**(android/androidx/java/kotlin/google/…)、按 **app > 混淆 > 具名三方** 排序(`limit` 在排序后);`search_in_code` 新增 `scope` + `include_libs`。后台索引改为**选择性**(只反编译 T1 app + T2 混淆、跳 T4 标准库;`--index-include`/`--index-exclude`/`--index-all` 调整)。部分覆盖瓶颈的根因修复:phase-3 用 **`unload()`(释放反编译 IR)+ `ConstStorage.removeForClass`(释放 const 累积)** 释放每个类,以"并行反编译→barrier→串行释放"分块进行——**单轮 20GB 即覆盖全部价值类**(抖音 312,498 类 / 100% / 峰值 19.3GB,旧版仅 ~14%)。 |
 | **v1.1.0** | 2026-06-08 | **stdio 传输**(`--stdio`):MCP 客户端(如 Claude Code)拉起并持有进程,目标 APK 运行时用 `load_apk` 加载——HTTP 保留为默认。**修复**:`index_status` 在从磁盘复用完整索引时回填 `symbols`/`edges`/`const_strings`(此前显示 0,但数据一直都在)。 |
 | **v1.1.1** | 2026-06-08 | **字符串工具清理:** `find_string_usages` 改为仅精确匹配(完整字面量);子串搜索归 `search_string_constants`(FTS 加速)。移除重叠的 `contains` 选项及其慢速 `LIKE` 全表扫,两个字符串工具职责正交。 |
 | **v1.0.1** | 2026-06-08 | 版本号对齐;**CI/CD**(GitHub Actions:构建 fat jar、上传 artifact、打 `v*` tag 时把 jar 附到 Release)。 |

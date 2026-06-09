@@ -48,9 +48,10 @@ public final class ToolRegistry {
 
 		// ---------- session ----------
 		t.add(Tools.tool("load_apk",
-				"Load (or switch to) an APK/DEX/AAB/XAPK/APKM/JAR for analysis. Resident + lazy: classes "
-						+ "decompile on demand, and a background SQLite index (symbols/xref + FTS code search) "
-						+ "builds afterward. Call this first; poll index_status for search readiness.",
+				"Load (or switch to) an APK/DEX/AAB/XAPK/APKM/JAR for analysis. Returns as soon as the model is "
+						+ "loaded; a background index then builds by analysis-value tier (xref → entry → main → rest) "
+						+ "so high-value code is searchable progressively — you need not wait for full coverage. Call "
+						+ "this first; poll index_status (xref_ready/main_ready/current_tier) for what is searchable now.",
 				Tools.schema(Tools.strProp("path", "Absolute path to the input file")
 						+ "," + Tools.boolProp("deobf", "Enable jadx deobfuscation (default false; off is better for "
 								+ "heavily-obfuscated apps)"),
@@ -61,8 +62,12 @@ public final class ToolRegistry {
 				Tools.schemaObject(null), args -> svc.currentApkInfo()));
 
 		t.add(Tools.tool("index_status",
-				"Background index build progress (state/percent/symbols/edges/strings). search_in_code and "
-						+ "string tools are fully populated once state=ready.",
+				"Background index build progress with TIERED availability: the build advances xref → entry → "
+						+ "main → rest, and each tier is searchable as it completes (you need not wait for 100%). "
+						+ "Key fields: current_tier, xref_ready (get_xrefs_* usable), main_ready (app main package "
+						+ "searchable), decompiled_classes vs indexed_classes, percent, coverage_complete. "
+						+ "search_in_code already covers every decompiled class while building; coverage_complete=true "
+						+ "means the whole in-scope set is in FTS.",
 				Tools.schemaObject(null), args -> svc.indexStatus().toMap()));
 
 		t.add(Tools.tool("clear_cache", "Clear in-heap caches (disk index retained for reuse).",
@@ -173,25 +178,35 @@ public final class ToolRegistry {
 
 		// ---------- strings (RE main line, Tier-1) ----------
 		t.add(Tools.tool("search_string_constants",
-				"Substring search over const-string literals → matching strings + their classes. The primary "
-						+ "locator on obfuscated apps (names are meaningless; string literals are not).",
+				"Substring search over const-string literals, aggregated by class (one row per class + its "
+						+ "matching strings). The primary locator on obfuscated apps (names are meaningless; string "
+						+ "literals are not). Standard-library classes (android/androidx/java/kotlin/google/…) are "
+						+ "filtered by default and results are ranked app > obfuscated > third-party; set "
+						+ "include_libs=true to keep stdlib hits.",
 				Tools.schema(Tools.strProp("query", "substring to find") + ","
-						+ Tools.intProp("limit", "max results (default 200)"), "query"),
+						+ Tools.intProp("limit", "max classes (default 200)") + ","
+						+ Tools.boolProp("include_libs", "include standard-library class hits (default false)"),
+						"query"),
 				args -> {
 					int limit = Pagination.intArg(args, "limit", 200, 1, 2000);
-					List<Map<String, Object>> hits = svc.codeSearch().searchStringConstants(reqStr(args, "query"), limit);
+					List<Map<String, Object>> hits = svc.codeSearch().searchStringConstants(
+							reqStr(args, "query"), limit, boolArg(args, "include_libs", false));
 					return withIndexNote(Map.of("count", hits.size(), "matches", hits));
 				}));
 
 		t.add(Tools.tool("find_string_usages",
-				"Classes that contain an EXACT string literal (whole-literal match). For substring / partial "
-						+ "matching use search_string_constants (FTS-accelerated).",
+				"Classes that contain an EXACT string literal (whole-literal match), one row per class. For "
+						+ "substring / partial matching use search_string_constants (FTS-accelerated). Standard-library "
+						+ "classes are filtered by default (set include_libs=true to keep them); ranked app > obfuscated "
+						+ "> third-party.",
 				Tools.schema(Tools.strProp("value", "the exact string literal to match in full") + ","
-						+ Tools.intProp("limit", "max results (default 200)"), "value"),
+						+ Tools.intProp("limit", "max classes (default 200)") + ","
+						+ Tools.boolProp("include_libs", "include standard-library class hits (default false)"),
+						"value"),
 				args -> {
 					int limit = Pagination.intArg(args, "limit", 200, 1, 2000);
-					List<Map<String, Object>> hits = svc.codeSearch()
-							.findStringUsages(reqStr(args, "value"), limit);
+					List<Map<String, Object>> hits = svc.codeSearch().findStringUsages(
+							reqStr(args, "value"), limit, boolArg(args, "include_libs", false));
 					return withIndexNote(Map.of("count", hits.size(), "usages", hits));
 				}));
 
@@ -336,16 +351,23 @@ public final class ToolRegistry {
 
 		// ---------- code search (Tier-3) + name search ----------
 		t.add(Tools.tool("search_in_code",
-				"Full-text code search via the FTS5 trigram index (≥3-char substrings); set regex=true (or use "
-						+ "regex metachars) to fall back to ripgrep over the disk code cache. Returns 'index building' "
-						+ "note if not yet ready.",
+				"Full-text code search over decompiled sources via the FTS5 trigram index (≥3-char substrings); "
+						+ "set regex=true (or use regex metachars) to fall back to ripgrep. While the index is still "
+						+ "building it transparently covers EVERY already-decompiled class (FTS ∪ ripgrep over the "
+						+ "decompiled sources), so the main package is searchable long before the build finishes; an "
+						+ "index_note reports current coverage. Results are one row per class, default-filter "
+						+ "standard-library hits, and are ranked app > obfuscated > third-party (limit applied after "
+						+ "ranking). Use scope to restrict to a package subtree, include_libs to keep stdlib hits.",
 				Tools.schema(Tools.strProp("query", "substring or regex") + ","
 						+ Tools.boolProp("regex", "treat query as a regex (ripgrep)") + ","
-						+ Tools.intProp("limit", "max results (default 100)"), "query"),
+						+ Tools.strProp("scope", "restrict to this package prefix subtree (e.g. com.app.feature)") + ","
+						+ Tools.boolProp("include_libs", "include standard-library class hits (default false)") + ","
+						+ Tools.intProp("limit", "max classes (default 100)"), "query"),
 				args -> {
 					int limit = Pagination.intArg(args, "limit", 100, 1, 1000);
 					Map<String, Object> res = svc.codeSearch().searchInCode(reqStr(args, "query"),
-							boolArg(args, "regex", false), limit);
+							boolArg(args, "regex", false), limit, optStr(args, "scope"),
+							boolArg(args, "include_libs", false));
 					return withIndexNote(res);
 				}));
 
@@ -435,15 +457,26 @@ public final class ToolRegistry {
 		return out;
 	}
 
-	/** Attach an "index still building" hint when a structural/string query may be incomplete. */
+	/**
+	 * Attach a coverage hint while the index is incomplete (progressive-index-availability 4.2). The note
+	 * reports the active tier and what is already searchable — decompiled vs FTS-indexed counts, plus
+	 * {@code main_ready}/{@code xref_ready} — so a caller can judge result completeness without parsing
+	 * index_status separately. Dropped entirely once {@code coverage_complete} (full FTS, no caveat). The
+	 * tool's return structure is otherwise unchanged.
+	 */
 	private Object withIndexNote(Map<String, Object> base) {
-		if (!svc.indexStatus().isReady()) {
-			Map<String, Object> m = new LinkedHashMap<>(base);
-			m.put("index_note", "index still building (" + svc.indexStatus().toMap().get("percent")
-					+ "%); results may be partial — poll index_status");
-			return m;
+		var st = svc.indexStatus();
+		if (st.coverageComplete()) {
+			return base; // full coverage — no caveat needed
 		}
-		return base;
+		var sm = st.toMap();
+		Map<String, Object> m = new LinkedHashMap<>(base);
+		m.put("index_note", "index building [" + sm.get("current_tier") + " tier, " + sm.get("percent")
+				+ "%]: searched " + sm.get("decompiled_classes") + " decompiled classes ("
+				+ sm.get("indexed_classes") + " in FTS); main_ready=" + sm.get("main_ready")
+				+ ", xref_ready=" + sm.get("xref_ready")
+				+ " — results may be partial; poll index_status until coverage_complete");
+		return m;
 	}
 
 	private List<Map<String, Object>> stringResources() {

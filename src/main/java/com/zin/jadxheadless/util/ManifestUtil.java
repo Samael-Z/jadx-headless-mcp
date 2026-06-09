@@ -1,6 +1,8 @@
 package com.zin.jadxheadless.util;
 
 import java.io.StringReader;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -75,6 +77,58 @@ public final class ManifestUtil {
 		} catch (Exception e) {
 			return null;
 		}
+	}
+
+	/** Manifest component tags whose {@code android:name} is a real app class (Tier-1 entry points). */
+	private static final String[] ENTRY_TAGS = { "activity", "service", "receiver", "provider", "application" };
+
+	/**
+	 * Fully-qualified names of the app's manifest entry-point components — every {@code <activity>},
+	 * {@code <service>}, {@code <receiver>}, {@code <provider>} plus the {@code <application>} class.
+	 * These are Tier-1 of the progressive build (decompiled first, so the most analysis-relevant code
+	 * is searchable within seconds; see progressive-index-availability D2). Leading {@code .} / bare
+	 * names are resolved against the manifest package. Returns an empty set when there is no manifest or
+	 * it fails to parse — the builder then proceeds straight to the main-package tier (D2 fallback).
+	 *
+	 * <p>{@code <activity-alias>} is intentionally skipped: its {@code android:name} is an alias, not a
+	 * class — the real class is its {@code targetActivity}, already covered by the {@code <activity>} scan.
+	 */
+	public static Set<String> entryClasses(JadxDecompiler jadx) {
+		String xml = manifestXml(jadx);
+		if (xml == null) {
+			return Set.of();
+		}
+		Set<String> out = new LinkedHashSet<>();
+		try {
+			Document doc = parse(xml);
+			String pkg = doc.getDocumentElement().getAttribute("package");
+			for (String tag : ENTRY_TAGS) {
+				NodeList nodes = doc.getElementsByTagName(tag);
+				for (int i = 0; i < nodes.getLength(); i++) {
+					String fqn = resolveName(attrName((Element) nodes.item(i)), pkg);
+					if (fqn != null) {
+						out.add(fqn);
+					}
+				}
+			}
+		} catch (Exception e) {
+			LOG.warn("entry-class parse failed: {}", e.toString());
+		}
+		return out;
+	}
+
+	/** Resolve a manifest component name (leading {@code .} or bare) against the package; null if blank. */
+	private static String resolveName(String name, String pkg) {
+		if (name == null || name.isEmpty()) {
+			return null;
+		}
+		if (name.startsWith(".") && pkg != null && !pkg.isEmpty()) {
+			return pkg + name;
+		}
+		if (!name.contains(".") && pkg != null && !pkg.isEmpty()) {
+			return pkg + "." + name;
+		}
+		return name;
 	}
 
 	private static String scanForLauncher(NodeList nodes, String pkg) {

@@ -6,7 +6,7 @@
 
     <groupId>com.zin.jadxheadless</groupId>
     <artifactId>jadx-headless-mcp-v2</artifactId>
-    <version>1.1.1</version>
+    <version>1.4.0</version>
     <packaging>jar</packaging>
     <name>jadx-headless-mcp-v2</name>
     <description>Headless jadx decompiler + MCP server (single-process, Streamable HTTP) for reverse engineering</description>

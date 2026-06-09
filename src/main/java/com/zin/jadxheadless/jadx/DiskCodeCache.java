@@ -6,8 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -51,11 +52,17 @@ public final class DiskCodeCache implements ICodeCache {
 		this.codeVersionFile = cacheDir.resolve("code").resolve("code-version");
 		this.codeVersion = codeVersion;
 		int threads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
-		this.writePool = Executors.newFixedThreadPool(threads, r -> {
-			Thread t = new Thread(r, "code-cache-writer");
-			t.setDaemon(true);
-			return t;
-		});
+		// BOUNDED queue + caller-runs backpressure (fast-index-pipeline): the parallel index build can
+		// decompile faster than these threads write .java to disk; an unbounded queue would let pending
+		// write tasks — each retaining a decompiled-source ICodeInfo — pile up and grow heap without bound
+		// (the old serial-FTS path implicitly throttled this). When the queue is full the decompile thread
+		// writes inline, throttling itself to disk speed (which is not the bottleneck) and capping heap.
+		this.writePool = new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS,
+				new ArrayBlockingQueue<>(256), r -> {
+					Thread t = new Thread(r, "code-cache-writer");
+					t.setDaemon(true);
+					return t;
+				}, new ThreadPoolExecutor.CallerRunsPolicy());
 		this.clsDataMap = buildClassDataMap(root.getClasses());
 		if (checkCodeVersion()) {
 			loadCachedSet();

@@ -13,12 +13,14 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.zin.jadxheadless.index.AnalysisScope;
 import com.zin.jadxheadless.index.CodeSearchIndex;
 import com.zin.jadxheadless.index.Db;
 import com.zin.jadxheadless.index.IndexBuilder;
 import com.zin.jadxheadless.index.IndexStatus;
 import com.zin.jadxheadless.util.CacheLayout;
 import com.zin.jadxheadless.util.DexId;
+import com.zin.jadxheadless.util.ManifestUtil;
 
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
@@ -59,6 +61,24 @@ public final class JadxService implements AutoCloseable {
 
 	private volatile Session session;
 
+	// Index-scope options (CLI: --index-include / --index-exclude / --index-all); applied on every load.
+	private volatile List<String> indexInclude = List.of();
+	private volatile List<String> indexExclude = List.of();
+	private volatile boolean indexAll = false;
+	private volatile boolean indexThirdParty = true;
+
+	/** Set the selective-index scope options from CLI args (see {@link AnalysisScope}). */
+	public void setIndexOptions(List<String> include, List<String> exclude, boolean all) {
+		this.indexInclude = include == null ? List.of() : include;
+		this.indexExclude = exclude == null ? List.of() : exclude;
+		this.indexAll = all;
+	}
+
+	/** Whether named T3 third-party libraries are indexed (default true; {@code --no-index-third-party} off). */
+	public void setIndexThirdParty(boolean indexThirdParty) {
+		this.indexThirdParty = indexThirdParty;
+	}
+
 	/** Per-APK resident state. Swapped atomically on {@link JadxService#loadApk}. */
 	public static final class Session {
 		final Path apk;
@@ -72,6 +92,7 @@ public final class JadxService implements AutoCloseable {
 		final CodeSearchIndex codeSearch;
 		final IndexStatus indexStatus;
 		final IndexBuilder builder;
+		final AnalysisScope scope;
 		final RenameStore renameStore = new RenameStore();
 		final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -83,7 +104,7 @@ public final class JadxService implements AutoCloseable {
 
 		Session(Path apk, boolean deobf, Path cacheDir, JadxDecompiler jadx, DiskCodeCache diskCache,
 				SqliteUsageInfoCache usageCache, Db db, com.zin.jadxheadless.index.SymbolGraph graph,
-				CodeSearchIndex codeSearch, IndexStatus indexStatus, IndexBuilder builder) {
+				CodeSearchIndex codeSearch, IndexStatus indexStatus, IndexBuilder builder, AnalysisScope scope) {
 			this.apk = apk;
 			this.deobf = deobf;
 			this.cacheDir = cacheDir;
@@ -95,6 +116,7 @@ public final class JadxService implements AutoCloseable {
 			this.codeSearch = codeSearch;
 			this.indexStatus = indexStatus;
 			this.builder = builder;
+			this.scope = scope;
 		}
 	}
 
@@ -153,13 +175,35 @@ public final class JadxService implements AutoCloseable {
 		Db db = Db.open(cacheDir);
 		Path codeSrcDir = cacheDir.resolve("code").resolve("sources");
 		com.zin.jadxheadless.index.SymbolGraph graph = new com.zin.jadxheadless.index.SymbolGraph(db);
-		CodeSearchIndex codeSearch = new CodeSearchIndex(db, codeSrcDir);
+		// FTS is split into M shards (fast-index-pipeline D2). The shard count is fixed for an index
+		// (routing must be stable): reuse the stored count if present, else the env/default.
+		int shardCount = com.zin.jadxheadless.index.FtsShards.shardCountFromEnv();
+		String storedShards = db.getMeta("fts_shards");
+		if (storedShards != null) {
+			try {
+				shardCount = Integer.parseInt(storedShards.trim());
+			} catch (NumberFormatException ignored) {
+				// keep env/default
+			}
+		}
+		com.zin.jadxheadless.index.FtsShards shards =
+				new com.zin.jadxheadless.index.FtsShards(cacheDir.resolve("fts"), shardCount);
+		CodeSearchIndex codeSearch = new CodeSearchIndex(db, codeSrcDir, shards);
 		IndexStatus indexStatus = new IndexStatus();
+
+		// Analysis-value scope: drives result filtering/ranking (layer 1) and selective indexing (layer 2).
+		String manifestPkg = ManifestUtil.packageName(jadx);
+		AnalysisScope scope = new AnalysisScope(manifestPkg, indexInclude, indexExclude, indexThirdParty, indexAll);
+		codeSearch.setScope(scope);
+		codeSearch.setStatus(indexStatus); // cross-phase search needs the build phase (D5)
+		indexStatus.setScope(scope.describe());
+		LOG.info("[scope] manifest package={}; index scope={}", manifestPkg, scope.describe());
+
 		IndexBuilder builder = new IndexBuilder(jadx, db, graph, codeSearch, indexStatus,
-				diskHolder[0], usageCache);
+				diskHolder[0], usageCache, scope);
 
 		Session s = new Session(apk, deobf, cacheDir, jadx, diskHolder[0], usageCache, db, graph,
-				codeSearch, indexStatus, builder);
+				codeSearch, indexStatus, builder, scope);
 		this.session = s;
 
 		// replay persisted renames before serving, then start the background index build
@@ -191,6 +235,11 @@ public final class JadxService implements AutoCloseable {
 			s.jadx.close();
 		} catch (Throwable t) {
 			LOG.warn("jadx close failed: {}", t.toString());
+		}
+		try {
+			s.codeSearch.close(); // close the FTS shard connections (checkpoint WAL)
+		} catch (Throwable ignored) {
+			// ignore
 		}
 		try {
 			s.db.close();

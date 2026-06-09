@@ -1,5 +1,9 @@
 package com.zin.jadxheadless;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,6 +40,18 @@ public final class Main {
 			return;
 		}
 
+		if (args.benchDecompile) {
+			if (args.apk == null) {
+				System.err.println("--bench-decompile requires --apk <path>");
+				System.exit(2);
+				return;
+			}
+			BenchDecompile.run(args.apk, args.deobf, args.limit, args.threads,
+					args.indexInclude, args.indexExclude, args.indexAll);
+			System.exit(0);
+			return;
+		}
+
 		if (args.selftest) {
 			if (args.apk == null) {
 				System.err.println("--selftest requires --apk <path>");
@@ -51,12 +67,14 @@ public final class Main {
 					// keep default
 				}
 			}
-			SelfTest.run(args.apk, args.deobf, wait);
+			SelfTest.run(args.apk, args.deobf, wait, args.indexInclude, args.indexExclude, args.indexAll);
 			System.exit(0);
 			return;
 		}
 
 		JadxService svc = new JadxService();
+		svc.setIndexOptions(args.indexInclude, args.indexExclude, args.indexAll);
+		svc.setIndexThirdParty(args.indexThirdParty);
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 			LOG.info("shutting down");
 			svc.close();
@@ -118,6 +136,13 @@ public final class Main {
 		boolean deobf = false;
 		boolean selftest = false;
 		boolean stdio = false;
+		boolean benchDecompile = false;
+		int limit = 20000;
+		int threads = Math.max(2, Runtime.getRuntime().availableProcessors());
+		final List<String> indexInclude = new ArrayList<>();
+		final List<String> indexExclude = new ArrayList<>();
+		boolean indexAll = false;
+		boolean indexThirdParty = true;
 
 		static Args parse(String[] a) {
 			Args r = new Args();
@@ -138,8 +163,29 @@ public final class Main {
 					case "--selftest":
 						r.selftest = true;
 						break;
+					case "--bench-decompile":
+						r.benchDecompile = true;
+						break;
+					case "--limit":
+						r.limit = Integer.parseInt(next(a, ++i));
+						break;
+					case "--threads":
+						r.threads = Integer.parseInt(next(a, ++i));
+						break;
 					case "--stdio":
 						r.stdio = true;
+						break;
+					case "--index-include":
+						addPrefixes(r.indexInclude, next(a, ++i));
+						break;
+					case "--index-exclude":
+						addPrefixes(r.indexExclude, next(a, ++i));
+						break;
+					case "--index-all":
+						r.indexAll = true;
+						break;
+					case "--no-index-third-party":
+						r.indexThirdParty = false;
 						break;
 					case "-h":
 					case "--help":
@@ -154,6 +200,16 @@ public final class Main {
 			return r;
 		}
 
+		/** Accept comma-separated and/or repeated package prefixes. */
+		private static void addPrefixes(List<String> into, String value) {
+			for (String p : Arrays.asList(value.split(","))) {
+				String t = p.trim();
+				if (!t.isEmpty()) {
+					into.add(t);
+				}
+			}
+		}
+
 		private static String next(String[] a, int i) {
 			if (i >= a.length) {
 				throw new IllegalArgumentException("missing value for " + a[i - 1]);
@@ -163,7 +219,13 @@ public final class Main {
 
 		private static void usage() {
 			System.err.println("Usage: java -Xmx20g -Djava.awt.headless=true -jar jadx-headless-mcp-v2.jar "
-					+ "[--host 127.0.0.1] [--port 8650] [--apk <path>] [--deobf] [--stdio]");
+					+ "[--host 127.0.0.1] [--port 8650] [--apk <path>] [--deobf] [--stdio]\n"
+					+ "       [--index-include <pkg,pkg>] [--index-exclude <pkg,pkg>] [--index-all] [--no-index-third-party]\n"
+					+ "       [--bench-decompile [--limit N=20000] [--threads M=cores]]\n"
+					+ "  Index scope (analysis-value): default skips stdlib (android/androidx/java/kotlin/google/…);\n"
+					+ "  --index-all indexes everything; --no-index-third-party also skips named T3 libs;\n"
+					+ "  --index-include/-exclude override by package prefix.\n"
+					+ "  --bench-decompile: spike measuring the pure decompile floor at full quality (fast-index-pipeline task 0).");
 		}
 	}
 }

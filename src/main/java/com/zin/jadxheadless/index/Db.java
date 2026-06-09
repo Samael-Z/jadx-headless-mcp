@@ -1,10 +1,13 @@
 package com.zin.jadxheadless.index;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,8 +33,12 @@ public final class Db implements AutoCloseable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(Db.class);
 
-	/** Bump to invalidate an incompatible on-disk schema. */
-	public static final int SCHEMA_VERSION = 1;
+	/**
+	 * Bump to invalidate an incompatible on-disk schema. v2 (fast-index-pipeline): the FTS layer
+	 * ({@code code_fts}/{@code const_strings}/{@code string_fts}) moved out of this DB into the
+	 * {@link FtsShards} files under {@code fts/}, and the graph indexes are now built after bulk load.
+	 */
+	public static final int SCHEMA_VERSION = 2;
 
 	/** Edge types. */
 	public static final int E_CALLS = 0; // method -> method (callee)
@@ -87,6 +94,10 @@ public final class Db implements AutoCloseable {
 	/** Open (creating if needed) the SQLite DB at {@code cacheDir/index.db} and ensure the schema exists. */
 	public static Db open(Path cacheDir) throws SQLException {
 		Path dbFile = cacheDir.resolve("index.db");
+		// Migration: an on-disk index from an older schema is incompatible (createSchema stamps the
+		// current version, so we must wipe stale data BEFORE that). The decompiled code cache is keyed
+		// separately (codeVersion) and stays valid — only the SQLite index + FTS shards are rebuilt.
+		wipeIfIncompatible(cacheDir, dbFile);
 		String url = "jdbc:sqlite:" + dbFile.toAbsolutePath();
 		Connection c = DriverManager.getConnection(url);
 		applyPragmas(c);
@@ -95,10 +106,66 @@ public final class Db implements AutoCloseable {
 		return db;
 	}
 
+	/** If an existing {@code index.db} has a different {@code schema_version}, delete it + the {@code fts/} shards. */
+	private static void wipeIfIncompatible(Path cacheDir, Path dbFile) {
+		if (!Files.exists(dbFile)) {
+			return;
+		}
+		Integer ver = null;
+		try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.toAbsolutePath());
+				Statement st = c.createStatement();
+				ResultSet rs = st.executeQuery("SELECT v FROM meta WHERE k='schema_version'")) {
+			if (rs.next()) {
+				ver = Integer.parseInt(rs.getString(1).trim());
+			}
+		} catch (Exception ignored) {
+			// no meta table / unreadable → treat as incompatible
+		}
+		if (ver != null && ver == SCHEMA_VERSION) {
+			return; // compatible — keep
+		}
+		LOG.info("[db] on-disk schema {} != {} — wiping incompatible index + fts shards (code cache kept)",
+				ver, SCHEMA_VERSION);
+		deleteQuietly(dbFile);
+		deleteQuietly(Path.of(dbFile + "-wal"));
+		deleteQuietly(Path.of(dbFile + "-shm"));
+		deleteDirQuietly(cacheDir.resolve("fts"));
+	}
+
+	private static void deleteQuietly(Path p) {
+		try {
+			Files.deleteIfExists(p);
+		} catch (Exception e) {
+			LOG.warn("[db] could not delete {}: {}", p, e.toString());
+		}
+	}
+
+	private static void deleteDirQuietly(Path dir) {
+		if (dir == null || !Files.exists(dir)) {
+			return;
+		}
+		try (Stream<Path> s = Files.walk(dir)) {
+			s.sorted((a, b) -> b.getNameCount() - a.getNameCount()).forEach(p -> {
+				try {
+					Files.deleteIfExists(p);
+				} catch (Exception ignored) {
+					// best effort
+				}
+			});
+		} catch (Exception e) {
+			LOG.warn("[db] could not delete dir {}: {}", dir, e.toString());
+		}
+	}
+
 	/** A fresh dedicated connection for the background index writer (WAL: concurrent with readers). */
 	public Connection openWriter() throws SQLException {
 		Connection w = DriverManager.getConnection("jdbc:sqlite:" + dbFile.toAbsolutePath());
 		applyPragmas(w);
+		try (Statement st = w.createStatement()) {
+			// The writer builds the graph indexes by sorting 29.5M edges; spill that sort to disk rather
+			// than native RAM (temp_store=MEMORY would balloon system memory and starve the JVM heap).
+			st.execute("PRAGMA temp_store=FILE");
+		}
 		return w;
 	}
 
@@ -111,39 +178,44 @@ public final class Db implements AutoCloseable {
 					+ "dex_id  TEXT NOT NULL,"
 					+ "fqn     TEXT NOT NULL,"
 					+ "pkg     TEXT)");
-			st.execute("CREATE INDEX IF NOT EXISTS ix_cls_dex ON classes(dex_id)");
 
+			// dex_id is NOT marked UNIQUE: the build de-dups in-heap (SymbolGraph.symIds), and a UNIQUE
+			// constraint would force per-insert index maintenance during the multi-million-row bulk load.
 			st.execute("CREATE TABLE IF NOT EXISTS symbols ("
 					+ "id      INTEGER PRIMARY KEY,"
 					+ "kind    INTEGER NOT NULL,"
-					+ "dex_id  TEXT NOT NULL UNIQUE,"
+					+ "dex_id  TEXT NOT NULL,"
 					+ "cls_dex TEXT NOT NULL,"
 					+ "name    TEXT,"
 					+ "display TEXT,"
 					+ "cls_idx INTEGER)");
-			st.execute("CREATE INDEX IF NOT EXISTS ix_sym_clsdex ON symbols(cls_dex)");
 
 			st.execute("CREATE TABLE IF NOT EXISTS edges ("
 					+ "src  INTEGER NOT NULL,"
 					+ "dst  INTEGER NOT NULL,"
 					+ "type INTEGER NOT NULL)");
-			st.execute("CREATE INDEX IF NOT EXISTS ix_edge_dst ON edges(dst, type)");
-			st.execute("CREATE INDEX IF NOT EXISTS ix_edge_src ON edges(src, type)");
 
-			// Contentless FTS5 (text lives on the disk code cache; rowid = cls_idx). Trigram tokenizer
-			// gives substring/regex-candidate matching (the Google Code Search / Zoekt model).
-			st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS code_fts USING fts5("
-					+ "body, content='', tokenize='trigram')");
-
-			st.execute("CREATE TABLE IF NOT EXISTS const_strings ("
-					+ "id      INTEGER PRIMARY KEY,"
-					+ "str     TEXT NOT NULL,"
-					+ "cls_idx INTEGER NOT NULL)");
-			st.execute("CREATE INDEX IF NOT EXISTS ix_cstr_cls ON const_strings(cls_idx)");
-			st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS string_fts USING fts5("
-					+ "str, content='const_strings', content_rowid='id', tokenize='trigram')");
+			// The FTS layer (code_fts / const_strings / string_fts) lives in the per-shard DBs under
+			// fts/ (see FtsShards), so M writer threads can tokenize in parallel — not in this DB.
+			// Graph indexes (ix_*) are created AFTER the bulk structure+usage load — see createGraphIndexes.
 
 			setMeta("schema_version", Integer.toString(SCHEMA_VERSION));
+		}
+	}
+
+	/**
+	 * Build the graph query indexes once, AFTER the multi-million-row structure+usage bulk insert
+	 * (fast-index-pipeline 3.1). Maintaining these per-insert during the load is the classic bulk-load
+	 * killer; deferring them to one post-load pass is dramatically faster. Idempotent ({@code IF NOT
+	 * EXISTS}) so a resume that already built them is a no-op. Runs on the writer connection.
+	 */
+	public static void createGraphIndexes(Connection w) throws SQLException {
+		try (Statement st = w.createStatement()) {
+			st.execute("CREATE INDEX IF NOT EXISTS ix_cls_dex ON classes(dex_id)");
+			st.execute("CREATE INDEX IF NOT EXISTS ix_sym_dex ON symbols(dex_id)");
+			st.execute("CREATE INDEX IF NOT EXISTS ix_sym_clsdex ON symbols(cls_dex)");
+			st.execute("CREATE INDEX IF NOT EXISTS ix_edge_dst ON edges(dst, type)");
+			st.execute("CREATE INDEX IF NOT EXISTS ix_edge_src ON edges(src, type)");
 		}
 	}
 
